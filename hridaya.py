@@ -1,25 +1,27 @@
 # -*- coding: utf-8 -*-
 """
-HRIDAYA (हृदय) - Automated ECG Arrhythmia & Anomaly Diagnostic Hub
+HRIDAYA (हृदय) - ECG Research Companion  |  Website edition
 Run:  streamlit run app.py --server.maxUploadSize 1000
 
-Design rules (why this differs from the earlier two versions)
- * Every number shown is computed from the uploaded data. Nothing is hard-coded,
-   "calibrated" or random-generated.
- * Beat classifier (AAMI N/S/V/F/Q) is trained and tested ONLY on beats from the
-   uploaded dataset's reference annotations (.atr). Accuracy = hold-out test accuracy.
- * The 13 conditions are screened with signal-processing rules on the uploaded ECG.
-   Where the leads in the file cannot support a condition (e.g. LVH needs V1 + V5),
-   the app says "Not assessable" instead of guessing.
- * Rule outputs are validated against the dataset's own annotations where those exist
-   (AFib, 2nd-degree block, LBBB, RBBB) and the agreement table is shown.
- * Screening/research tool only - not a certified medical device.
+What changed in this version
+ * Theme matches the HRIDAYA mobile app: maroon app bar, cream background, gold accents,
+   tile home screen, chat-bubble assistant screen.
+ * New "HRIDAYA Assistant" page: ECG concepts, explanation of the model's ACTUAL results,
+   research/dataset help, in-app guidance, and voice (mic input + spoken replies).
+ * The assistant is rule-based (built-in knowledge base). It never invents findings: every
+   number it quotes is read from the analysis results stored in this session.
+ * Analysis engine (signal processing, 13-condition rules, beat classifier) is unchanged.
+
+Screening/research tool only - not a certified medical device.
 """
 from __future__ import annotations
 
+import base64
 import datetime
 import html
+import json
 import os
+import re
 import shutil
 import tempfile
 import zipfile
@@ -33,6 +35,8 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import streamlit as st
+import streamlit.components.v1 as components
+from matplotlib.colors import LinearSegmentedColormap
 from scipy.signal import butter, filtfilt, find_peaks
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
@@ -53,6 +57,14 @@ OWNER = {
     "phone": "9535309338",
     "email": "sanjanakbhatunitech@gmail.com",
 }
+
+# Brand palette (from the HRIDAYA mobile app mockup)
+MAROON = "#8B1E23"
+GOLD = "#D4AF37"
+CREAM = "#FAF7F0"
+BEIGE = "#E8DCC6"
+BROWN = "#3A1F1F"
+CMAP = LinearSegmentedColormap.from_list("hridaya", [CREAM, "#D9B8A8", MAROON])
 
 CONDITIONS = [
     dict(id=1, name="Atrial Fibrillation (AFib)", tier="Critical",
@@ -99,6 +111,8 @@ ANN_TO_AAMI = {s: c for c, syms in AAMI_CLASSES.items() for s in syms}
 BEAT_SYMBOLS = set(ANN_TO_AAMI)               # annotation symbols treated as beats
 NORMAL_CONDUCTED = {"N", "L", "R", "e", "j"}  # used for PR/QRS/ST/QT measurement
 AAMI_ORDER = ["N", "S", "V", "F", "Q"]
+AAMI_NAMES = {"N": "normal/bundle-branch/escape", "S": "supraventricular ectopic",
+              "V": "ventricular ectopic", "F": "fusion", "Q": "paced/unclassifiable"}
 
 DOCTORS = [
     dict(name="Dr. Nagamani A. C.", exp="23 Years", spec="MBBS, DM - Cardiology",
@@ -331,7 +345,6 @@ def measure_beat(xf, fs, r, prev_r=None, next_r=None):
         p_amp = float(seg[kk] - iso)
         if 0 < kk < len(seg) - 1 and p_amp >= 0.05 * ref_amp and seg[kk] >= seg[kk - 1] and seg[kk] >= seg[kk + 1]:
             p_idx = a + kk
-            p_on = _walk(xf - (iso + 0.2 * p_amp), p_idx, -1, 0.0, int(0.12 * fs), run=1) if False else p_idx
             j = p_idx
             while j > a and xf[j] > iso + 0.2 * p_amp and p_idx - j < int(0.12 * fs):
                 j -= 1
@@ -849,14 +862,15 @@ def record_conditions_df(res):
 # ======================================================================
 def plot_confusion(cm, labels, title):
     fig, axes = plt.subplots(1, 2, figsize=(11, 4))
-    sns.heatmap(cm, annot=True, fmt="d", cmap="RdPu", xticklabels=labels, yticklabels=labels, ax=axes[0], cbar=False)
-    axes[0].set_title(f"{title} - counts")
+    fig.patch.set_facecolor(CREAM)
+    sns.heatmap(cm, annot=True, fmt="d", cmap=CMAP, xticklabels=labels, yticklabels=labels, ax=axes[0], cbar=False)
+    axes[0].set_title(f"{title} - counts", color=BROWN)
     norm = cm / np.maximum(cm.sum(1, keepdims=True), 1)
-    sns.heatmap(norm, annot=True, fmt=".2f", cmap="RdPu", vmin=0, vmax=1, xticklabels=labels, yticklabels=labels, ax=axes[1], cbar=False)
-    axes[1].set_title(f"{title} - row-normalised (sensitivity)")
+    sns.heatmap(norm, annot=True, fmt=".2f", cmap=CMAP, vmin=0, vmax=1, xticklabels=labels, yticklabels=labels, ax=axes[1], cbar=False)
+    axes[1].set_title(f"{title} - row-normalised (sensitivity)", color=BROWN)
     for a in axes:
-        a.set_xlabel("Predicted class")
-        a.set_ylabel("True class (reference annotation)")
+        a.set_xlabel("Predicted class", color=BROWN)
+        a.set_ylabel("True class (reference annotation)", color=BROWN)
     fig.tight_layout()
     return fig
 
@@ -866,43 +880,113 @@ def plot_waveform(rec, start_s, dur_s, samples, symbols):
     a, b = int(start_s * fs), int((start_s + dur_s) * fs)
     n_lead = min(2, rec["signal"].shape[1])
     fig, axes = plt.subplots(n_lead, 1, figsize=(11, 2.8 * n_lead), sharex=True, squeeze=False)
+    fig.patch.set_facecolor(CREAM)
     t = np.arange(a, min(b, rec["signal"].shape[0])) / fs
     in_win = (samples >= a) & (samples < b)
     for i in range(n_lead):
         ax = axes[i, 0]
+        ax.set_facecolor("#FFFFFF")
         y = rec["signal"][a:b, i]
-        ax.plot(t[:len(y)], y, color="#d90429", lw=1.1)
+        ax.plot(t[:len(y)], y, color=MAROON, lw=1.1)
         pk = samples[in_win]
-        ax.scatter(pk / fs, rec["signal"][pk, i], s=18, color="#1f4e79", zorder=3)
+        ax.scatter(pk / fs, rec["signal"][pk, i], s=18, color=GOLD, edgecolor=BROWN, linewidth=0.4, zorder=3)
         if symbols is not None:
             for s_, sym in zip(pk, symbols[in_win]):
-                ax.text(s_ / fs, rec["signal"][s_, i], sym, fontsize=8, color="#5A2A38", ha="center", va="bottom", weight="bold")
-        ax.set_ylabel(f"{rec['sig_names'][i]}")
-        ax.grid(True, ls="--", alpha=0.3)
-    axes[-1, 0].set_xlabel("Time (s)")
-    axes[0, 0].set_title("ECG with beat markers" + (" (reference annotation symbols)" if symbols is not None else " (detected R peaks)"))
+                ax.text(s_ / fs, rec["signal"][s_, i], sym, fontsize=8, color=BROWN, ha="center", va="bottom", weight="bold")
+        ax.set_ylabel(f"{rec['sig_names'][i]}", color=BROWN)
+        ax.grid(True, ls="--", alpha=0.35, color=BEIGE)
+    axes[-1, 0].set_xlabel("Time (s)", color=BROWN)
+    axes[0, 0].set_title("ECG with beat markers" + (" (reference annotation symbols)" if symbols is not None else " (detected R peaks)"), color=BROWN)
     fig.tight_layout()
     return fig
 
 
 # ======================================================================
-# 7. UI HELPERS
+# 7. THEME + APP-BAR (matches the HRIDAYA mobile app)
 # ======================================================================
 CSS = """
 <style>
-.stApp { background:#FFFFFF; color:#1A1A1A; }
-.stApp h1,.stApp h2,.stApp h3,.stApp h4,.stApp h5,.stApp p,.stApp li,.stApp label { color:#1A1A1A; }
-[data-testid="stSidebar"] { background:#FCE4EC; }
-[data-testid="stSidebar"] * { color:#5A2A38; }
-[data-testid="stFileUploader"] section { background:#FFF0F3; border:2px dashed #F48FB1; }
-.stButton>button,.stDownloadButton>button { background:#F48FB1; color:#FFFFFF; border:0; border-radius:8px; }
-.stButton>button:hover,.stDownloadButton>button:hover { background:#EC6C9C; color:#FFFFFF; }
-div[data-testid="stMetric"] { background:#FFF0F3; border:1px solid #F8BBD0; border-radius:8px; padding:12px; }
-div[data-testid="stMetric"] * { color:#1A1A1A !important; }
-.doc-card { background:#FFF0F3; border:1px solid #F8BBD0; border-radius:10px; padding:14px 18px; margin-bottom:12px; color:#1A1A1A; }
-.footer { text-align:center; font-size:0.85rem; color:#5A2A38; border-top:1px solid #F8BBD0; padding-top:10px; margin-top:30px; }
+.stApp { background:#FAF7F0; color:#3A1F1F; }
+.stApp h1,.stApp h2,.stApp h3,.stApp h4,.stApp h5,.stApp p,.stApp li,.stApp label,.stApp span { color:#3A1F1F; }
+header[data-testid="stHeader"] { background:transparent; }
+.block-container { padding-top:1.2rem; max-width:1150px; }
+
+/* sidebar */
+[data-testid="stSidebar"] { background:#E8DCC6; }
+[data-testid="stSidebar"] * { color:#3A1F1F; }
+[data-testid="stSidebar"] [role="radiogroup"] label { padding:6px 10px; border-radius:10px; }
+[data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) { background:#8B1E23; }
+[data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) * { color:#FAF7F0; }
+
+/* app bar */
+.appbar { background:#8B1E23; border-radius:16px; padding:12px 18px; display:flex; align-items:center; gap:12px; margin-bottom:18px; box-shadow:0 2px 10px rgba(58,31,31,.18); }
+.appbar .brand { color:#FAF7F0; font-size:1.35rem; font-weight:700; letter-spacing:.04em; }
+.appbar .where { color:#E8DCC6; font-size:.95rem; margin-left:auto; }
+.appbar svg { flex:none; }
+
+/* hero */
+.hero h1 { font-size:2.1rem; line-height:1.15; margin:0 0 6px 0; color:#3A1F1F; }
+.hero p { font-size:1.05rem; color:#5b3a3a; max-width:46ch; }
+.tagline { color:#B08A1E; font-weight:600; }
+
+/* buttons */
+.stButton>button,.stDownloadButton>button { background:#8B1E23; color:#FAF7F0; border:0; border-radius:12px; padding:.55rem 1rem; }
+.stButton>button:hover,.stDownloadButton>button:hover { background:#6f171b; color:#FAF7F0; }
+.stButton>button p,.stDownloadButton>button p { color:#FAF7F0; }
+.stButton>button:focus-visible { outline:3px solid #D4AF37; outline-offset:2px; }
+.stButton>button[kind="primary"] { width:100%; min-height:56px; font-size:1.05rem; font-weight:600; border-radius:14px; }
+
+/* home tiles */
+div[class*="st-key-tile_"] .stButton>button { min-height:112px; width:100%; background:#FFFFFF; color:#8B1E23; border:1px solid #E8DCC6; border-radius:20px; box-shadow:0 2px 8px rgba(58,31,31,.08); font-weight:600; }
+div[class*="st-key-tile_"] .stButton>button p { color:#8B1E23; font-size:1.05rem; }
+div[class*="st-key-tile_"] .stButton>button:hover { border-color:#D4AF37; background:#FFF9EA; }
+
+/* chip buttons (assistant suggestions) */
+div[class*="st-key-chip_"] .stButton>button { background:#FFFFFF; color:#8B1E23; border:1px solid #D4AF37; border-radius:999px; padding:.25rem .8rem; font-size:.85rem; }
+div[class*="st-key-chip_"] .stButton>button p { color:#8B1E23; font-size:.85rem; }
+div[class*="st-key-chip_"] .stButton>button:hover { background:#FFF3CF; }
+
+/* metrics, uploader, cards */
+div[data-testid="stMetric"] { background:#FFFFFF; border:1px solid #E8DCC6; border-radius:14px; padding:12px; }
+div[data-testid="stMetric"] * { color:#3A1F1F !important; }
+[data-testid="stFileUploader"] section { background:#FFFFFF; border:2px dashed #D4AF37; border-radius:14px; }
+.doc-card { background:#FFFFFF; border:1px solid #E8DCC6; border-left:5px solid #8B1E23; border-radius:12px; padding:14px 18px; margin-bottom:12px; color:#3A1F1F; }
+.doc-card a { color:#8B1E23; }
+[data-testid="stExpander"] { background:#FFFFFF; border:1px solid #E8DCC6; border-radius:12px; }
+
+/* chat bubbles */
+[data-testid="stChatMessage"] { background:#F3ECDD; border:1px solid #E8DCC6; border-radius:16px; padding:12px 16px; }
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) { background:#8B1E23; border-color:#8B1E23; }
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) * { color:#FAF7F0 !important; }
+[data-testid="stChatInput"] { border:1px solid #8B1E23; border-radius:14px; }
+
+.footer { text-align:center; font-size:0.85rem; color:#3A1F1F; border-top:1px solid #E8DCC6; padding-top:10px; margin-top:30px; }
 </style>
 """
+
+
+def logo_svg(size=40, heart="#FAF7F0", pulse="#D4AF37"):
+    return (f'<svg width="{size}" height="{size}" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-label="HRIDAYA logo">'
+            f'<path d="M32 56 C10 40 6 24 16 15 C23 9 30 13 32 19 C34 13 41 9 48 15 C58 24 54 40 32 56Z" '
+            f'fill="none" stroke="{heart}" stroke-width="4" stroke-linejoin="round"/>'
+            f'<polyline points="6,34 21,34 26,23 33,45 38,29 42,34 58,34" fill="none" stroke="{pulse}" '
+            f'stroke-width="3.2" stroke-linejoin="round" stroke-linecap="round"/></svg>')
+
+
+def logo_img_html(width=170):
+    """Use hridaya_logo.png (next to app.py) on the home screen if it exists."""
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hridaya_logo.png")
+    if os.path.exists(p):
+        with open(p, "rb") as fh:
+            b64 = base64.b64encode(fh.read()).decode()
+        return f'<img src="data:image/png;base64,{b64}" width="{width}" alt="HRIDAYA logo">'
+    return logo_svg(width // 2, heart=MAROON, pulse=GOLD)
+
+
+def appbar(page_label):
+    st.markdown(
+        f"<div class='appbar'>{logo_svg(36)}<span class='brand'>HRIDAYA</span>"
+        f"<span class='where'>{html.escape(page_label)}</span></div>", unsafe_allow_html=True)
 
 
 def footer():
@@ -913,10 +997,351 @@ def footer():
         unsafe_allow_html=True)
 
 
+# ======================================================================
+# 8. HRIDAYA ASSISTANT  (knowledge base + grounded result explanations + voice)
+# ======================================================================
+GREETING = (
+    "Hi! I'm **HRIDAYA Assistant**, your ECG guide. I can help with:\n\n"
+    "- ECG concepts and terminology (P wave, QRS, ST, QT, sampling, filtering)\n"
+    "- Explaining your model results from this session\n"
+    "- Research and dataset help (MIT-BIH, splits, sensitivity, specificity, F1, quantization, 1D-CNN)\n"
+    "- Using the app: uploads, running analysis, reading charts, fixing errors\n"
+    "- Voice: tap the mic to speak, and turn on spoken replies in Settings\n\n"
+    "How can I assist you today?")
+
+SUGGESTIONS = ["What does the P wave represent?", "Explain my results", "What is MIT-BIH?",
+               "How do I upload a file?", "Sensitivity vs specificity", "Why is a condition 'Not assessable'?"]
+
+KB = [
+    dict(id="greet_scope", title="What the assistant can and can't do",
+         kw=["what can you do", "capabilities", "who are you", "what are you"],
+         text="I'm a rule-based assistant built into this app. I answer from a built-in ECG and machine-learning knowledge base, and "
+              "when you ask about results I read the numbers straight from the analysis stored in this session. "
+              "I don't give diagnoses or treatment advice, and I won't make up findings."),
+    dict(id="pwave", title="P wave",
+         kw=["p wave", "p waves", "p-wave", "p-waves", "atrial depolarization", "atrial depolarisation"],
+         text="The **P wave** is the electrical activation (depolarization) of the atria, the upper chambers. It shows that the sinoatrial "
+              "node, the heart's natural pacemaker, has fired.\n\n**Key points**\n- Normal duration: about 0.08-0.12 s\n"
+              "- Normal amplitude: up to about 0.25 mV\n- Best seen in Lead II\n- Absent or replaced by chaotic activity in atrial fibrillation"),
+    dict(id="pr", title="PR interval and AV blocks",
+         kw=["pr interval", "pr segment", "first-degree", "first degree", "av block", "heart block", "mobitz", "wenckebach", "complete heart block", "third-degree", "third degree"],
+         text="The **PR interval** runs from the start of the P wave to the start of the QRS. It reflects conduction delay through the AV node. Normal is about 120-200 ms.\n\n"
+              "- **First-degree block**: PR above 200 ms, every beat still conducts\n- **Mobitz I (Wenckebach)**: PR lengthens beat by beat until one beat is dropped\n"
+              "- **Mobitz II**: beats drop suddenly with a constant PR\n- **Complete block**: atria and ventricles beat independently\n\n"
+              "In this app PR is measured with threshold-based delineation, so treat it as approximate."),
+    dict(id="qrs", title="QRS complex and bundle branch block",
+         kw=["qrs", "qrs complex", "qrs width", "ventricular depolarization", "bundle branch", "lbbb", "rbbb", "wide qrs"],
+         text="The **QRS complex** is ventricular depolarization, the main spike on the ECG. Normal width is under about 120 ms (often 80-100 ms).\n\n"
+              "A wide QRS suggests slow conduction through the ventricles, for example **bundle branch block** (RBBB has an 'M' shape in V1, LBBB is broad and monophasic) "
+              "or a ventricular ectopic beat. This app measures QRS width from the signal slope and uses V1 for side classification when V1 exists; "
+              "on a single lead the side is low confidence."),
+    dict(id="st", title="ST segment, STEMI and ischemia",
+         kw=["st segment", "st elevation", "st depression", "stemi", "ischemia", "ischaemia", "j point", "j-point", "myocardial infarction"],
+         text="The **ST segment** is the flat stretch between the end of the QRS and the start of the T wave. Elevation or depression of about 0.1 mV or more can point to ischemia or infarction.\n\n"
+              "This app measures ST at J-point + 60 ms against the PR-segment baseline, needs a signal calibrated in mV, skips records with wide QRS (unreliable), "
+              "and only 'Suspects' because a single lead can't confirm; at least two contiguous leads are needed clinically."),
+    dict(id="qt", title="T wave and QT / QTc",
+         kw=["qt", "qtc", "qt interval", "t wave", "t-wave", "bazett", "long qt", "torsades"],
+         text="The **T wave** is ventricular repolarization. The **QT interval** runs from QRS start to T-wave end. Because QT shortens at faster heart rates it is corrected: "
+              "**QTc (Bazett) = QT / sqrt(RR in seconds)**.\n\nQTc above about 450 ms is flagged as prolonged here. Bazett over-corrects when HR is above 100, and the T-wave end is hard to locate, "
+              "so the app reports 'Inconclusive' when it can't find it reliably."),
+    dict(id="hr", title="Heart rate, RR interval and R-peaks",
+         kw=["heart rate", "rr interval", "rr intervals", "bpm", "bradycardia", "tachycardia", "hrv", "r-r", "r peak", "r peaks", "r-peak", "r-peaks", "pan-tompkins", "pan tompkins"],
+         text="**Heart rate = 60 / RR interval (seconds)**, where RR is the time between two R-peaks. Below 60 bpm is bradycardia; above 100 bpm is tachycardia.\n\n"
+              "R-peaks are found with a Pan-Tompkins-style detector: band-pass 5-15 Hz, derivative, squaring, moving-window integration, then a refractory period of 250 ms. "
+              "If your file has reference annotations (.atr), those beat positions are used instead."),
+    dict(id="afib", title="Atrial fibrillation",
+         kw=["afib", "atrial fibrillation", "irregularly irregular", "fibrillation"],
+         text="**Atrial fibrillation** is an irregularly irregular rhythm with no organised P waves, which raises stroke risk. The app looks at RR irregularity in 30-beat windows "
+              "(coefficient of variation and RMSSD/RR both above 0.15), skips ectopic-heavy windows, and checks whether P waves are found. Where the dataset has rhythm annotations, "
+              "the result is compared against them in the validation table."),
+    dict(id="fs", title="Sampling frequency",
+         kw=["sampling", "sampling frequency", "sampling rate", "sample rate", "fs", "hz", "nyquist", "resampling", "360 hz"],
+         text="**Sampling frequency (fs)** is how many samples per second are recorded. MIT-BIH uses 360 Hz. By Nyquist, fs must be at least twice the highest frequency you care about; "
+              "QRS energy sits roughly below 40 Hz, so 250-500 Hz is typical for diagnostic work.\n\nIf you upload CSV/TXT files, set the correct sampling rate and units in **Settings**: a wrong fs "
+              "makes every interval (heart rate, PR, QT) wrong. Models trained at one fs need resampling if the input uses another."),
+    dict(id="filter", title="Filtering and noise",
+         kw=["filter", "filtering", "baseline wander", "noise", "powerline", "power line", "band-pass", "bandpass", "denoise", "artifact", "artefact", "butterworth", "emg"],
+         text="ECG is contaminated by **baseline wander** (below about 0.5 Hz, breathing and movement), **powerline** interference (50 Hz in India), and **muscle noise** (above about 40 Hz).\n\n"
+              "This app uses zero-phase Butterworth band-pass filters (filtfilt, so waves are not shifted in time): 5-15 Hz for R-peak detection and 0.5-40 Hz for interval measurements. "
+              "Heavy high-pass filtering can distort the ST segment, which is one reason ST findings are only 'Suspected'."),
+    dict(id="leads", title="Leads and LVH",
+         kw=["lead", "leads", "mlii", "v1", "v5", "12-lead", "12 lead", "sokolow", "lvh", "hypertrophy"],
+         text="A **lead** is one view of the heart's electrical activity. MIT-BIH records have two leads (usually MLII plus V1 or V5). Lead II/MLII is best for rhythm and P waves; V1 is best for bundle branch blocks.\n\n"
+              "**LVH** uses the Sokolow-Lyon rule (S in V1 + R in V5/V6 of at least 3.5 mV), so it needs both leads in mV. If the file lacks them, the app says 'Not assessable' instead of guessing."),
+    dict(id="aami", title="AAMI beat classes (N, S, V, F, Q)",
+         kw=["aami", "ectopic", "pvc", "pac", "supraventricular", "fusion", "paced", "beat class", "beat classes", "annotation", "annotations", "atr", "symbols", "ec57"],
+         text="The app groups beat annotations into the five **AAMI EC57** classes:\n\n- **N**: normal, bundle-branch beats, escape beats\n- **S**: supraventricular ectopic (atrial premature etc.)\n"
+              "- **V**: ventricular ectopic (PVC)\n- **F**: fusion of ventricular and normal\n- **Q**: paced or unclassifiable\n\nThe `.atr` file holds the cardiologist-verified beat labels the classifier learns from."),
+    dict(id="mitbih", title="MIT-BIH Arrhythmia Database",
+         kw=["mit-bih", "mitbih", "mit bih", "physionet", "dataset", "datasets", "48 records", "wfdb", ".hea", ".dat", "database"],
+         text="The **MIT-BIH Arrhythmia Database** (PhysioNet) has 48 half-hour two-channel ambulatory ECG recordings from 47 subjects, sampled at 360 Hz, with beat-by-beat annotations by cardiologists.\n\n"
+              "A WFDB record is a set of files: `.hea` (header), `.dat` (signal) and `.atr` (annotations). Common cautions: classes are highly imbalanced (normal beats dominate), and the AAMI protocol usually excludes the four paced records (102, 104, 107, 217)."),
+    dict(id="prep", title="Preprocessing pipeline",
+         kw=["preprocess", "preprocessing", "pre-processing", "segmentation", "normalise", "normalize", "normalization", "beat segment", "z-score", "feature", "features", "window"],
+         text="Typical pipeline: **filter, locate R-peaks, cut a window around each beat, resample to a fixed length, normalise**.\n\n"
+              "In this app each beat is cut from 0.25 s before to 0.27 s after the R-peak, resampled to 188 samples, z-score normalised, and combined with summary statistics and RR-interval features "
+              "(previous/next RR and their ratio to the local median) before classification."),
+    dict(id="split", title="Train/test splits and leakage",
+         kw=["train", "test", "split", "splits", "patient-wise", "inter-patient", "leakage", "validation", "overfit", "overfitting", "generalisation", "generalization", "cross-validation", "stratified", "intra-patient"],
+         text="A **beat-level split** puts beats from the same patient in both train and test, so the model can memorise a patient's quirks and the score looks too good (data leakage). "
+              "A **patient-wise (inter-patient) split** keeps whole records out of training, which measures real generalisation and is normally lower.\n\n"
+              "The app reports both: a stratified 80/20 beat-level hold-out and, when enabled in Settings, a patient-wise check on unseen records. Quote the patient-wise number when claiming generalisation."),
+    dict(id="metrics", title="Accuracy, sensitivity, specificity, F1",
+         kw=["sensitivity", "specificity", "f1", "f1 score", "f1-score", "precision", "recall", "accuracy", "metric", "metrics", "macro", "imbalance", "imbalanced"],
+         text="- **Accuracy** = correct / total. Misleading when one class dominates.\n- **Sensitivity (recall)** = TP / (TP + FN): how many true cases you catch.\n"
+              "- **Specificity** = TN / (TN + FP): how many non-cases you correctly clear.\n- **Precision** = TP / (TP + FP).\n- **F1** = harmonic mean of precision and recall.\n"
+              "- **Macro** averages treat each class equally.\n\nFor arrhythmias, check per-class recall and macro F1: a model can reach 90%+ accuracy by predicting 'normal' almost every time."),
+    dict(id="cm", title="Confusion matrix",
+         kw=["confusion matrix", "confusion", "heatmap", "row-normalised", "row normalised", "row-normalized"],
+         text="In the **confusion matrix**, rows are the true class (from annotations) and columns are the predicted class. The diagonal is correct predictions. "
+              "The left panel shows counts; the right panel divides each row by its total, so the diagonal equals per-class **sensitivity**. Off-diagonal cells show which classes get confused, "
+              "for example S beats predicted as N."),
+    dict(id="quant", title="Quantization",
+         kw=["quantization", "quantisation", "quantized", "int8", "tflite", "on-device", "edge deployment", "pruning", "compress", "compression"],
+         text="**Quantization** stores weights (and often activations) as 8-bit integers instead of 32-bit floats. Model size drops about 4x and inference gets faster on phones, which suits an Android app.\n\n"
+              "Do post-training quantization with a representative calibration set, then **re-measure sensitivity per class**: rare classes (S, F) can degrade more than overall accuracy suggests. "
+              "Note: this website's classifier is a Random Forest, which is not quantized."),
+    dict(id="cnn", title="1D-CNN and the models used",
+         kw=["cnn", "1d-cnn", "1d cnn", "convolution", "convolutional", "deep learning", "neural", "mlp", "random forest", "architecture", "which model", "what model"],
+         text="A **1D-CNN** slides learned filters along the time axis of a beat, so it finds waveform shapes (a wide QRS, a missing P) automatically. A typical design is several conv + pooling blocks, then dense layers and a softmax over the beat classes.\n\n"
+              "This website's classifier is a **Random Forest** on hand-built beat and RR features. If your paper or mobile app uses an MLP or a 1D-CNN, its numbers are separate: don't mix them with the figures shown here."),
+    dict(id="howto", title="Uploading and running an analysis",
+         kw=["upload", "zip", "how do i", "how to", "run analysis", "supported", "file format", "csv", "txt", "folder", "getting started", "get started"],
+         text="**To analyse an ECG dataset**\n\n1. Open **Upload & Analysis** (or tap *Upload ECG File* on Home).\n2. Choose a `.zip` containing WFDB records (`.hea` + `.dat`/`.mat`, optional `.atr`) or CSV/TXT signals, one column per lead. Subfolders are fine.\n"
+              "3. For CSV/TXT, set sampling rate and units in **Settings** first.\n4. Click **Run full analysis**.\n5. Read the accuracy cards, confusion matrix, 13-condition table and risk table, then open **Waveform & Screener** for one record.\n"
+              "6. Use **Review & Sign-Off** to download an HTML report you can print to PDF.\n\nPre-segmented 187-column beat files aren't supported: they hold no rhythm, PR or QT information."),
+    dict(id="charts", title="Reading the charts",
+         kw=["chart", "charts", "waveform", "plot", "graph", "slider", "marker", "markers", "interpret", "read the"],
+         text="The **waveform** shows up to two leads over the window you pick. Gold dots mark beats; if the file has annotations, each dot carries its symbol (N, V, A, L, R ...), otherwise the dots are detected R-peaks. "
+              "Use the sliders to change window length and start time. The **bar chart** counts beats per AAMI class, and the **risk table** lists HR, QRS, PR, QTc and flagged conditions per record."),
+    dict(id="trouble", title="Troubleshooting",
+         kw=["error", "troubleshoot", "not working", "problem", "fail", "failed", "skipped", "not assessable", "inconclusive", "wfdb is missing", "no records", "no ecg records", "memory", "slow", "maxuploadsize", "too large", "200mb", "stuck"],
+         text="**Common issues**\n\n- **'wfdb is missing'**: run `pip install wfdb` and restart the app.\n- **'No ECG records found'**: the ZIP needs `.hea` + `.dat` pairs (or numeric CSV/TXT files).\n"
+              "- **Upload too large**: start with `streamlit run app.py --server.maxUploadSize 1000`.\n- **Records skipped**: open the 'skipped' panel; typical reasons are a missing `.dat`, a record under 5 s, or a beat-matrix CSV.\n"
+              "- **'Not assessable'**: the file lacks what the rule needs (for example V1 and V5 for LVH, or mV calibration for ST). This is deliberate.\n"
+              "- **'Inconclusive'**: the P or T wave couldn't be located reliably, or AFib/wide QRS made the rule unreliable.\n- **Slow run**: lower 'Max beats for classifier' in Settings.\n"
+              "- **CSV intervals look wrong**: check sampling rate and units in Settings."),
+    dict(id="voice", title="Voice input and spoken replies",
+         kw=["voice", "microphone", "mic", "speech", "speak", "text to speech", "text-to-speech", "tts", "listen", "talk"],
+         text="Tap the **mic** on the Assistant page and speak; your words are sent as a message. Turn on **Speak assistant replies** in Settings to hear answers.\n\n"
+              "**Compatibility notes**\n- Works best in Chrome and Edge (desktop and Android). Firefox has no speech recognition.\n- The page must be on HTTPS or localhost, and you must allow microphone access.\n"
+              "- Chrome's speech recognition sends audio to an online service, so it needs internet.\n- Spoken replies use your device's voices and work offline on most systems.\n"
+              "- In an Android WebView, speech recognition is often unavailable and needs the RECORD_AUDIO permission wired in the app. Test it on real devices."),
+    dict(id="safety", title="Medical safety",
+         kw=["diagnose", "diagnosis", "safe", "medical", "doctor", "trust", "reliable", "emergency", "treatment", "medicine", "should i worry", "cardiologist"],
+         text="HRIDAYA is a **screening and research tool, not a certified medical device**. Its flags are not diagnoses and need review by a qualified clinician. "
+              "If you have chest pain, fainting, breathlessness, or palpitations with dizziness, treat it as an emergency and call 112 in India. The **Cardiologists** page lists clinics in Bengaluru."),
+]
+
+RES_TRIGGERS = ["my result", "my results", "my accuracy", "my model", "my analysis", "my record", "my dataset", "model result",
+                "model results", "the results", "these results", "explain results", "explain the results", "explain my",
+                "what did the model", "how did the model", "predicted class", "prediction", "predicted", "confidence",
+                "this record", "latest analysis", "analysis result", "analysis results", "flagged", "my risk"]
+
+CHIP_ICON = "💬"
+
+
+def _f(v, unit="", nd=0):
+    try:
+        return "n/a" if v is None or not np.isfinite(v) else f"{v:.{nd}f}{unit}"
+    except TypeError:
+        return "n/a"
+
+
+def explain_record(res, name):
+    lines = [f"**Record {name}**: screening risk **{res['risk']}**.",
+             f"Median HR {_f(res['hr_med'], ' bpm')}, QRS about {_f(res['qrs_ms'], ' ms')}, PR about {_f(res['pr_ms'], ' ms')}, "
+             f"QTc about {_f(res['qtc_ms'], ' ms')} (approximate threshold-based measurements; n/a means it could not be measured)."]
+    flagged = [(i, c) for i, c in res["conditions"].items() if c["status"] in FLAGGED]
+    if flagged:
+        lines.append("\n**Flagged conditions**")
+        for i, c in flagged:
+            lines.append(f"- **{COND_BY_ID[i]['name']}**: {c['status']}. {c['evidence']}")
+    else:
+        lines.append("\nNo condition was flagged for this record.")
+    n_inc = sum(c["status"] == "Inconclusive" for c in res["conditions"].values())
+    n_na = sum(c["status"] == "Not assessable" for c in res["conditions"].values())
+    lines.append(f"\n{n_inc} condition(s) were Inconclusive and {n_na} Not assessable with the leads in this file.")
+    if res["class_counts"]:
+        cc = ", ".join(f"{k}={v:,}" for k, v in res["class_counts"].items())
+        lines.append(f"Beat classes from the reference annotations: {cc}. Ectopic/non-normal burden: {_f(res['ectopic_burden'] * 100, '%', 1)}.")
+    lines.append("\n*Limitations: Detected/Suspected are screening flags, not diagnoses, and the delineation is approximate.*")
+    return "\n".join(lines)
+
+
+def explain_dataset(results):
+    per, ml = results["per"], results["ml"]
+    lines = [f"**Dataset:** {results['dataset']}, analysed {results['time']}. {len(per)} record(s) analysed"
+             + (f", {len(results['skipped'])} skipped." if results["skipped"] else ".")]
+    if ml:
+        lines.append(f"\n**Beat classifier (Random Forest, AAMI N/S/V/F/Q)**\n- Hold-out accuracy **{ml['accuracy']:.2%}**, macro F1 **{ml['macro_f1']:.2%}**, "
+                     f"macro sensitivity {ml['macro_sens']:.2%}, macro specificity {ml['macro_spec']:.2%}, on {ml['n_test']:,} test beats ({ml['n_train']:,} for training).")
+        rep = ml["report"]
+        per_cls, weakest = [], None
+        for lab in ml["labels"]:
+            r = rep.get(lab)
+            if r and r.get("support", 0) > 0:
+                per_cls.append(f"{lab} {r['recall']:.0%} (n={int(r['support']):,})")
+                if weakest is None or r["recall"] < weakest[1]:
+                    weakest = (lab, r["recall"], int(r["support"]))
+        if per_cls:
+            lines.append("- Per-class recall: " + ", ".join(per_cls) + ".")
+        if weakest and weakest[1] < 0.9:
+            lines.append(f"- Weakest class: **{weakest[0]}** ({AAMI_NAMES.get(weakest[0], '')}) with recall {weakest[1]:.0%} on {weakest[2]:,} test beats. "
+                         "Accuracy is dominated by normal beats, so this matters more than the headline number.")
+        if ml["patient"]:
+            p = ml["patient"]
+            lines.append(f"- Patient-wise check (unseen records): accuracy {p['accuracy']:.2%}, macro F1 {p['macro_f1']:.2%} on {p['n_test_records']} record(s). "
+                         f"Gap versus beat-level accuracy: {(ml['accuracy'] - p['accuracy']) * 100:+.2f} points; this is the better estimate of generalisation.")
+        for n in ml["notes"]:
+            lines.append(f"- Note: {n}")
+        lines.append("\n**Predicted class and confidence:** the app reports aggregate hold-out metrics. It does not keep per-beat predictions or probabilities, "
+                     "so there is no confidence score to explain.")
+    else:
+        lines.append(f"\n**Classifier:** {results['ml_msg']}")
+    n_high = sum(r["risk"] == "High" for r in per.values())
+    n_mod = sum(r["risk"] == "Moderate" for r in per.values())
+    n_low = sum(r["risk"] == "Low" for r in per.values())
+    lines.append(f"\n**Screening risk:** {n_high} high, {n_mod} moderate, {n_low} low.")
+    counts = {}
+    for r in per.values():
+        for i, c in r["conditions"].items():
+            if c["status"] in FLAGGED:
+                counts[COND_BY_ID[i]["name"]] = counts.get(COND_BY_ID[i]["name"], 0) + 1
+    if counts:
+        top = sorted(counts.items(), key=lambda kv: -kv[1])[:4]
+        lines.append("Most-flagged conditions: " + "; ".join(f"{n} ({c} record(s))" for n, c in top) + ".")
+    lines.append("\nAsk about a specific record by name (for example *explain record 100*) for its measurements and evidence.")
+    lines.append("\n*Limitations: one dataset, a single split seed, and rule-based screening. Treat the numbers as a research measurement, not clinical validation.*")
+    return "\n".join(lines)
+
+
+def assistant_reply(q):
+    t = re.sub(r"\s+", " ", q.lower().strip())
+    if re.fullmatch(r"(hi|hello|hey|hii|namaste|help|menu)[!. ?]*", t):
+        return GREETING
+    results = st.session_state.get("results")
+    per = results["per"] if results and results.get("per") else {}
+    rec_name = next((n for n in per if re.search(rf"(?<![\w.]){re.escape(n.lower())}(?![\w.])", t)), None)
+    results_intent = any(tr in t for tr in RES_TRIGGERS) or (rec_name is not None and "record" in t)
+    if results_intent:
+        if not per:
+            return ("I can't explain results yet because nothing has been analysed in this session. Go to **Upload & Analysis**, upload a ZIP, "
+                    "and click **Run full analysis**. Then ask me again and I'll walk through the actual numbers.")
+        if rec_name:
+            return explain_record(per[rec_name], rec_name)
+        return explain_dataset(results)
+    best, best_score = None, 0
+    for e in KB:
+        score = 0
+        for kw in e["kw"]:
+            if re.search(rf"(?<![\w]){re.escape(kw)}(?![\w])", t):
+                score += 1 + len(kw.split())
+        if score > best_score:
+            best, best_score = e, score
+    if best:
+        return best["text"]
+    topics = ", ".join(e["title"].lower() for e in KB[1:9])
+    return ("I don't have a good answer for that yet. I can help with ECG terms (" + topics + "), dataset and model questions, "
+            "how to use this app, and explaining your results. Try rephrasing, or tap one of the suggestions.")
+
+
+def clean_for_speech(text):
+    t = re.sub(r"`([^`]*)`", r"\1", text)
+    t = re.sub(r"[*_#>]+", "", t)
+    t = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", t)
+    t = re.sub(r"^\s*[-•]\s+", "", t, flags=re.M)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t[:900]
+
+
+def speak(text):
+    payload = json.dumps(clean_for_speech(text)).replace("</", "<\\/")
+    lang = json.dumps(st.session_state.get("voice_lang", "en-IN"))
+    components.html(f"""<script>
+(function() {{
+  try {{
+    const W = window.parent, s = W.speechSynthesis;
+    if (!s) return;
+    s.cancel();
+    const parts = {payload}.match(/[^.!?]+[.!?]*/g) || [];
+    parts.forEach(p => {{ const u = new W.SpeechSynthesisUtterance(p.trim()); u.lang = {lang}; s.speak(u); }});
+  }} catch (e) {{}}
+}})();
+</script>""", height=0)
+
+
+def voice_widget():
+    lang = json.dumps(st.session_state.get("voice_lang", "en-IN"))
+    components.html(f"""
+<style>
+ body {{ margin:0; font-family:system-ui,sans-serif; color:#3A1F1F; }}
+ .row {{ display:flex; align-items:center; gap:10px; }}
+ button {{ border:0; cursor:pointer; }}
+ #mic {{ width:46px; height:46px; border-radius:50%; background:#8B1E23; color:#FAF7F0; font-size:20px; }}
+ #mic.on {{ box-shadow:0 0 0 6px rgba(212,175,55,.45); }}
+ #stop {{ background:#E8DCC6; color:#3A1F1F; border-radius:999px; padding:6px 12px; font-size:13px; }}
+ #st {{ font-size:13px; }}
+</style>
+<div class="row">
+  <button id="mic" title="Speak to HRIDAYA" aria-label="Speak to HRIDAYA">🎤</button>
+  <button id="stop" title="Stop speaking">🔇 Stop voice</button>
+  <span id="st">Tap the mic and speak</span>
+</div>
+<script>
+(function() {{
+  const mic = document.getElementById('mic'), stopB = document.getElementById('stop'), st = document.getElementById('st');
+  let W;
+  try {{ W = window.parent; W.document; }} catch (e) {{ st.textContent = 'Voice is blocked in this browser view. Type instead.'; mic.disabled = true; return; }}
+  const SR = W.SpeechRecognition || W.webkitSpeechRecognition;
+  if (!SR) {{ st.textContent = 'Speech input is not supported here (try Chrome or Edge). You can still type.'; mic.disabled = true; }}
+  let rec = null, on = false;
+  mic.onclick = () => {{
+    if (on && rec) {{ rec.stop(); return; }}
+    try {{ W.speechSynthesis && W.speechSynthesis.cancel(); }} catch (e) {{}}
+    rec = new SR(); rec.lang = {lang}; rec.interimResults = false; rec.maxAlternatives = 1;
+    rec.onstart = () => {{ on = true; mic.classList.add('on'); st.textContent = 'Listening...'; }};
+    rec.onerror = (e) => {{
+      let hint = '';
+      if (e.error === 'not-allowed') hint = ' - allow microphone access for this site';
+      else if (e.error === 'network') hint = ' - the speech service needs internet';
+      else if (e.error === 'no-speech') hint = ' - nothing heard, try again';
+      st.textContent = 'Mic error: ' + e.error + hint;
+    }};
+    rec.onend = () => {{ on = false; mic.classList.remove('on'); }};
+    rec.onresult = (e) => {{ const text = e.results[0][0].transcript; st.textContent = 'Heard: ' + text; send(text); }};
+    try {{ rec.start(); }} catch (e) {{ st.textContent = 'Could not start the microphone.'; }}
+  }};
+  function send(text) {{
+    const P = W.document;
+    const ta = P.querySelector('textarea[data-testid="stChatInputTextArea"]') || P.querySelector('[data-testid="stChatInput"] textarea');
+    if (!ta) {{ st.textContent += ' (chat box not found; type it instead)'; return; }}
+    const setter = Object.getOwnPropertyDescriptor(W.HTMLTextAreaElement.prototype, 'value').set;
+    setter.call(ta, text);
+    ta.dispatchEvent(new W.Event('input', {{ bubbles: true }}));
+    setTimeout(() => {{ const b = P.querySelector('[data-testid="stChatInputSubmitButton"]'); if (b) b.click(); }}, 250);
+  }}
+  stopB.onclick = () => {{ try {{ W.speechSynthesis.cancel(); }} catch (e) {{}} }};
+}})();
+</script>""", height=60)
+
+
+def queue_question(q):
+    st.session_state["pending_q"] = q
+
+
+# ======================================================================
+# 9. SHARED UI HELPERS
+# ======================================================================
+def go(page):
+    st.session_state["nav"] = page
+
+
 def results_or_warn():
     r = st.session_state.get("results")
     if not r or not r["per"]:
-        st.warning("⚠️ Upload a dataset ZIP on **📁 MIT-BIH / ECG Zip Upload** and click **Run full analysis** first.")
+        st.warning("⚠️ Upload a dataset ZIP on **Upload & Analysis** and click **Run full analysis** first.")
         footer()
         return None
     return r
@@ -961,6 +1386,7 @@ def show_ml(ml, ml_msg):
     rep = rep.loc[[i for i in rep.index if i in ml["labels"] or i in ("macro avg", "weighted avg")]]
     st.dataframe(rep.round(3), use_container_width=True)
     st.caption("N = normal/BBB/escape, S = supraventricular ectopic, V = ventricular ectopic, F = fusion, Q = paced/unclassifiable (AAMI EC57 grouping).")
+    st.caption("Want this explained? Ask the **HRIDAYA Assistant**: 'Explain my results'.")
 
 
 def show_waveform_block(results, key_prefix):
@@ -995,8 +1421,8 @@ def report_html(results, sel):
     acc = (f"Hold-out accuracy {ml['accuracy']:.2%}, macro F1 {ml['macro_f1']:.2%} "
            f"({ml['n_test']:,} test beats)") if ml else "Not computed (no reference annotations)"
     return f"""<html><head><meta charset="utf-8"><title>HRIDAYA report</title>
-<style>body{{font-family:Arial;margin:30px;color:#1a1a1a}}table{{border-collapse:collapse;width:100%}}
-td,th{{border:1px solid #F8BBD0;padding:6px;font-size:13px}}th{{background:#FCE4EC}}h1{{color:#C2185B}}</style></head><body>
+<style>body{{font-family:Arial;margin:30px;color:#3A1F1F;background:#FAF7F0}}table{{border-collapse:collapse;width:100%}}
+td,th{{border:1px solid #E8DCC6;padding:6px;font-size:13px}}th{{background:#8B1E23;color:#FAF7F0}}h1{{color:#8B1E23}}</style></head><body>
 <h1>HRIDAYA - ECG Screening Report</h1>
 <p><b>Dataset:</b> {html.escape(results['dataset'])} &nbsp; <b>Record:</b> {html.escape(sel)} &nbsp; <b>Generated:</b> {results['time']}</p>
 <p><b>Overall screening risk:</b> {res['risk']} &nbsp; <b>Median HR:</b> {res['hr_med']:.0f} bpm &nbsp;
@@ -1010,35 +1436,58 @@ td,th{{border:1px solid #F8BBD0;padding:6px;font-size:13px}}th{{background:#FCE4
 
 
 # ======================================================================
-# 8. PAGES
+# 10. PAGES
 # ======================================================================
+P_HOME = "🏠 Home"
+P_UPLOAD = "📁 Upload & Analysis"
+P_SCREEN = "🔍 Waveform & Screener"
+P_RISK = "⚠️ Risk Summary"
+P_CHAT = "💬 HRIDAYA Assistant"
+P_RES = "📚 Research & Resources"
+P_DOCS = "🏥 Cardiologists"
+P_REVIEW = "📝 Review & Sign-Off"
+P_SET = "⚙️ Settings"
+PAGES = [P_HOME, P_UPLOAD, P_SCREEN, P_RISK, P_CHAT, P_RES, P_DOCS, P_REVIEW, P_SET]
+
+SETTING_DEFAULTS = dict(csv_fs=360, csv_units="mV", max_beats=80_000, patient_wise=True,
+                        speak_replies=False, voice_lang="en-IN")
+
+
 def page_home():
-    st.title("💓 HRIDAYA (हृदय): Automated ECG Arrhythmia & Anomaly Diagnostic Hub")
-    st.markdown("##### Multi-class heartbeat classification & 13-condition clinical screener")
-    st.info("Accuracy and every other figure in this app are computed from the dataset you upload - nothing is pre-filled. "
-            "Go to **📁 MIT-BIH / ECG Zip Upload** to begin.")
-    st.markdown("### The 13 conditions screened")
-    st.dataframe(pd.DataFrame([{"#": c["id"], "Condition": c["name"], "Description": c["desc"],
-                                "Risk tier": TIER_ICON[c["tier"]], "Needs": c["needs"]} for c in CONDITIONS]),
-                 use_container_width=True, hide_index=True)
-    st.markdown("### Supported uploads")
-    st.markdown(
-        "- **WFDB records** (`.hea` + `.dat`/`.mat`, optional `.atr`): MIT-BIH, INCART, European ST-T, PTB, PhysioNet challenge sets, etc.\n"
-        "- **CSV/TXT raw signals** (one column per lead; set sampling rate/units in the sidebar).\n"
-        "- Nested folders are searched recursively.\n"
-        "- Pre-segmented beat matrices (e.g. 187-column Kaggle files) are *not* supported - they contain no rhythm, PR or QT information.")
-    st.markdown("### How results are produced")
-    st.markdown(
-        "- **Accuracy:** a Random-Forest beat classifier is trained/tested on the dataset's own `.atr` annotations. "
-        "Without annotations, accuracy can't be computed and the app says so.\n"
-        "- **13 conditions:** signal-processing rules (R-peak detection, RR irregularity, PR/QRS/ST/QT delineation). "
-        "Conditions that the available leads can't support are marked *Not assessable* rather than guessed.\n"
-        "- **Validation:** rule outputs are compared with the dataset's rhythm/beat annotations (AFib, 2nd-degree block, LBBB, RBBB).")
+    left, right = st.columns([1, 1.15], gap="large")
+    with left:
+        st.markdown(f"<div style='padding:6px 0'>{logo_img_html(190)}</div>", unsafe_allow_html=True)
+    with right:
+        st.markdown("<div class='hero'><h1>Welcome,<br>to HRIDAYA</h1>"
+                    "<p>Upload your ECG, explore the analysis and get insights with our AI assistant.</p>"
+                    "<p class='tagline'>Understand signals. Explore research.</p></div>", unsafe_allow_html=True)
+        st.button("📄  Upload ECG File", type="primary", on_click=go, args=(P_UPLOAD,), key="home_upload")
+    st.write("")
+    t1, t2 = st.columns(2)
+    with t1:
+        st.button("📈  View Analysis", on_click=go, args=(P_SCREEN,), key="tile_analysis", use_container_width=True)
+        st.button("📖  Research & Resources", on_click=go, args=(P_RES,), key="tile_research", use_container_width=True)
+    with t2:
+        st.button("💬  Chat with HRIDAYA", on_click=go, args=(P_CHAT,), key="tile_chat", use_container_width=True)
+        st.button("⚙️  Settings", on_click=go, args=(P_SET,), key="tile_settings", use_container_width=True)
+    st.write("")
+    st.info("Accuracy and every other figure in this app are computed from the dataset you upload - nothing is pre-filled.")
+    with st.expander("The 13 conditions screened"):
+        st.dataframe(pd.DataFrame([{"#": c["id"], "Condition": c["name"], "Description": c["desc"],
+                                    "Risk tier": TIER_ICON[c["tier"]], "Needs": c["needs"]} for c in CONDITIONS]),
+                     use_container_width=True, hide_index=True)
+    with st.expander("Supported uploads and how results are produced"):
+        st.markdown(
+            "- **WFDB records** (`.hea` + `.dat`/`.mat`, optional `.atr`): MIT-BIH, INCART, European ST-T, PTB, PhysioNet challenge sets, etc.\n"
+            "- **CSV/TXT raw signals** (one column per lead; set sampling rate/units in Settings). Nested folders are searched recursively.\n"
+            "- Pre-segmented beat matrices (e.g. 187-column Kaggle files) are *not* supported - they contain no rhythm, PR or QT information.\n\n"
+            "- **Accuracy:** a Random-Forest beat classifier is trained/tested on the dataset's own `.atr` annotations. Without annotations, accuracy can't be computed and the app says so.\n"
+            "- **13 conditions:** signal-processing rules (R-peak detection, RR irregularity, PR/QRS/ST/QT delineation). Conditions the available leads can't support are *Not assessable*.\n"
+            "- **Validation:** rule outputs are compared with the dataset's rhythm/beat annotations (AFib, 2nd-degree block, LBBB, RBBB).")
     footer()
 
 
 def page_upload():
-    st.title("📁 Upload MIT-BIH / ECG ZIP Archive")
     if not WFDB_OK:
         st.error("The `wfdb` package is missing. Run `pip install wfdb` and restart.")
     up = st.file_uploader("Upload ECG dataset (.zip)", type=["zip"])
@@ -1113,7 +1562,6 @@ def page_upload():
 
 
 def page_screener():
-    st.title("🔍 Live Waveform & 13-Condition Screener")
     results = results_or_warn()
     if not results:
         return
@@ -1136,12 +1584,11 @@ def page_screener():
     st.dataframe(record_conditions_df(res), use_container_width=True, hide_index=True)
     if res["class_counts"]:
         st.markdown("### Beat classes in this record (reference annotations)")
-        st.bar_chart(pd.Series(res["class_counts"]))
+        st.bar_chart(pd.Series(res["class_counts"]), color=MAROON)
     footer()
 
 
 def page_risk():
-    st.title("⚠️ Clinical Risk Summary")
     results = results_or_warn()
     if not results:
         return
@@ -1170,12 +1617,60 @@ def page_risk():
         st.markdown("**Median ST deviation (J+60 ms)**")
         st.table(pd.DataFrame({"Lead": list(r["st_mv"].keys()), "ST (mV)": [round(v, 3) for v in r["st_mv"].values()]}))
     if r["risk"] in ("High", "Moderate"):
-        st.info("Consider cardiology review - see **🏥 Cardiologists in Bangalore**.")
+        st.info("Consider cardiology review - see **🏥 Cardiologists**.")
+    footer()
+
+
+def page_chat():
+    st.markdown("#### HRIDAYA Assistant · *Your ECG guide*")
+    st.caption("Answers come from a built-in ECG and machine-learning knowledge base plus the actual results of your analysis in this session. "
+               "No external AI service is used, and no findings are invented.")
+    voice_widget()
+
+    chat = st.session_state.setdefault("chat", [{"role": "assistant", "content": GREETING}])
+
+    cols = st.columns(3)
+    for k, q in enumerate(SUGGESTIONS):
+        with cols[k % 3]:
+            st.button(q, key=f"chip_{k}", on_click=queue_question, args=(q,), use_container_width=True)
+
+    for m in chat:
+        with st.chat_message(m["role"], avatar="💓" if m["role"] == "assistant" else None):
+            st.markdown(m["content"])
+
+    typed = st.chat_input("Type a message...")
+    pending = st.session_state.pop("pending_q", None)
+    q = typed or pending
+    if q:
+        chat.append({"role": "user", "content": q})
+        with st.chat_message("user"):
+            st.markdown(q)
+        reply = assistant_reply(q)
+        chat.append({"role": "assistant", "content": reply})
+        with st.chat_message("assistant", avatar="💓"):
+            st.markdown(reply)
+        if st.session_state.get("speak_replies"):
+            speak(reply)
+
+    if len(chat) > 1:
+        st.button("🧹 Clear conversation", key="clear_chat",
+                  on_click=lambda: st.session_state.update(chat=[{"role": "assistant", "content": GREETING}]))
+    footer()
+
+
+def page_resources():
+    st.markdown("Quick explainers from the HRIDAYA knowledge base. Ask the **HRIDAYA Assistant** for anything not covered here.")
+    st.button("💬 Ask the assistant", on_click=go, args=(P_CHAT,), key="res_to_chat")
+    for e in KB[1:]:
+        with st.expander(e["title"]):
+            st.markdown(e["text"])
+    st.markdown("### Links")
+    st.markdown("- [MIT-BIH Arrhythmia Database on PhysioNet](https://physionet.org/content/mitdb/1.0.0/)\n"
+                "- [WFDB Python package documentation](https://wfdb.readthedocs.io)")
     footer()
 
 
 def page_doctors():
-    st.title("🏥 Cardiologists in Bangalore")
     st.caption("Listing supplied by the author. Please verify availability, fees and credentials directly with the clinic before visiting.")
     for d in DOCTORS:
         q = quote_plus(f"{d['name'].split(' (')[0]} cardiologist {d['loc']}")
@@ -1191,7 +1686,6 @@ def page_doctors():
 
 
 def page_review():
-    st.title("📝 Final Review & Sign-Off")
     results = results_or_warn()
     if not results:
         return
@@ -1225,36 +1719,57 @@ def page_review():
     footer()
 
 
+def page_settings():
+    st.markdown("#### Analysis")
+    a, b = st.columns(2)
+    with a:
+        st.number_input("CSV/TXT sampling rate (Hz)", min_value=50, max_value=2000, step=10, key="csv_fs")
+        st.selectbox("CSV amplitude units", ["mV", "µV", "arbitrary"], key="csv_units")
+    with b:
+        st.slider("Max beats for classifier", 20_000, 150_000, step=10_000, key="max_beats")
+        st.checkbox("Also run patient-wise validation", key="patient_wise")
+    st.markdown("#### Assistant voice")
+    c, d = st.columns(2)
+    with c:
+        st.checkbox("Speak assistant replies", key="speak_replies")
+    with d:
+        st.selectbox("Voice language / accent", ["en-IN", "en-US", "en-GB"], key="voice_lang")
+    st.caption("Voice features need a browser with the Web Speech API (Chrome or Edge). Speech input needs microphone permission and, in Chrome, an internet connection. "
+               "Test on every target browser and on Android WebView before release.")
+    footer()
+
+
 # ======================================================================
-# 9. MAIN
+# 11. MAIN
 # ======================================================================
+PAGE_FUNCS = {P_HOME: page_home, P_UPLOAD: page_upload, P_SCREEN: page_screener, P_RISK: page_risk,
+              P_CHAT: page_chat, P_RES: page_resources, P_DOCS: page_doctors, P_REVIEW: page_review,
+              P_SET: page_settings}
+
+
 def main():
-    st.set_page_config(page_title="HRIDAYA (हृदय) - ECG Diagnostics", page_icon="💓", layout="wide")
+    st.set_page_config(page_title="HRIDAYA (हृदय) - ECG Research Companion", page_icon="💓", layout="wide")
     st.markdown(CSS, unsafe_allow_html=True)
-    st.sidebar.title("💓 HRIDAYA Controls")
-    page = st.sidebar.radio("Navigate Workspace:", [
-        "🏠 Home & Overview",
-        "📁 MIT-BIH / ECG Zip Upload",
-        "🔍 Live Waveform & 13-Condition Screener",
-        "⚠️ Clinical Risk Summary",
-        "🏥 Cardiologists in Bangalore",
-        "📝 Review & Sign-Off Report",
-    ])
-    with st.sidebar.expander("Analysis options"):
-        csv_fs = st.number_input("CSV/TXT sampling rate (Hz)", 50, 2000, 360)
-        csv_units = st.selectbox("CSV amplitude units", ["mV", "µV", "arbitrary"])
-        max_beats = st.slider("Max beats for classifier", 20_000, 150_000, 80_000, step=10_000)
-        patient_wise = st.checkbox("Also run patient-wise validation", True)
-    st.session_state["opts"] = dict(csv_fs=csv_fs, csv_units=csv_units, max_beats=max_beats, patient_wise=patient_wise)
+
+    # keep settings alive even when their widgets are not on screen
+    for k, v in SETTING_DEFAULTS.items():
+        st.session_state.setdefault(k, v)
+        st.session_state[k] = st.session_state[k]
+    st.session_state.setdefault("nav", P_HOME)
+    if st.session_state["nav"] not in PAGES:
+        st.session_state["nav"] = P_HOME
+
+    st.sidebar.markdown(f"<div style='display:flex;align-items:center;gap:8px'>{logo_svg(34, heart=MAROON, pulse=GOLD)}"
+                        f"<b style='font-size:1.2rem;color:{MAROON}'>HRIDAYA</b></div>", unsafe_allow_html=True)
+    st.sidebar.caption("ECG Research Companion")
+    page = st.sidebar.radio("Navigate", PAGES, key="nav", label_visibility="collapsed")
+    st.session_state["opts"] = dict(csv_fs=st.session_state["csv_fs"], csv_units=st.session_state["csv_units"],
+                                    max_beats=st.session_state["max_beats"], patient_wise=st.session_state["patient_wise"])
     st.sidebar.markdown("---")
     st.sidebar.markdown(f"**© Copyright Reserved**  \n**Author:** {OWNER['name']}  \n**Phone:** {OWNER['phone']}  \n**Email:** {OWNER['email']}")
 
-    {"🏠 Home & Overview": page_home,
-     "📁 MIT-BIH / ECG Zip Upload": page_upload,
-     "🔍 Live Waveform & 13-Condition Screener": page_screener,
-     "⚠️ Clinical Risk Summary": page_risk,
-     "🏥 Cardiologists in Bangalore": page_doctors,
-     "📝 Review & Sign-Off Report": page_review}[page]()
+    appbar(page.split(" ", 1)[1])
+    PAGE_FUNCS[page]()
 
 
 if __name__ == "__main__":
