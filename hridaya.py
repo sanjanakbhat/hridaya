@@ -63,13 +63,12 @@ def extract_morphological_features(beat_signal):
     return np.array(features)
 
 def parse_uploaded_mitbih_zip(extracted_path):
-    """Parses actual MIT-BIH .dat/.atr files uploaded via ZIP archive."""
     files = os.listdir(extracted_path)
     records = set([f.split('.')[0] for f in files if f.endswith('.dat') or f.endswith('.atr')])
     
     X, y = [], []
     for rec in sorted(list(records)):
-        if rec in ['102', '104', '107', '217']:  # Skip paced records per standard protocol
+        if rec in ['102', '104', '107', '217']:
             continue
         try:
             sig_path = os.path.join(extracted_path, rec)
@@ -108,7 +107,6 @@ class HridayaEngine:
             n_estimators=200, max_depth=25, min_samples_split=4,
             class_weight='balanced_subsample', random_state=42, n_jobs=-1
         )
-        # ANOMALY DETECTION ENGINE (Isolation Forest trained on normal sinus morphologies)
         self.anomaly_detector = IsolationForest(contamination=0.08, random_state=42)
         self.is_trained = False
 
@@ -129,7 +127,7 @@ class HridayaEngine:
                 base[85:100] += 1.5
             elif cls == 'V':
                 base += np.random.normal(0, 0.2, raw_signal_len)
-                base[75:110] += 2.2  # PVC anomaly pattern
+                base[75:110] += 2.2
             elif cls == 'S':
                 base += np.random.normal(0, 0.08, raw_signal_len)
                 base[60:80] += 0.9
@@ -153,7 +151,6 @@ class HridayaEngine:
         )
         
         self.classifier.fit(X_train, y_train)
-        # Train anomaly detector strictly on normal class behaviors
         self.anomaly_detector.fit(X_train[y_train == 'N'])
         self.is_trained = True
         
@@ -178,7 +175,6 @@ class HridayaEngine:
         class_order = self.classifier.classes_
         confidence = float(np.max(probs))
         
-        # ANOMALY CHECK: Isolation Forest Decision Function & Prediction
         anomaly_score = float(self.anomaly_detector.decision_function(scaled_feats)[0])
         is_isolated_anomaly = self.anomaly_detector.predict(scaled_feats)[0] == -1
         is_anomalous = bool(is_isolated_anomaly or pred_class != 'N')
@@ -193,7 +189,7 @@ class HridayaEngine:
         }
 
 # ==========================================
-# 4. STREAMLIT USER INTERFACE (WHITE THEME)
+# 4. STREAMLIT USER INTERFACE (BABY PINK THEME)
 # ==========================================
 def main():
     st.set_page_config(
@@ -202,24 +198,33 @@ def main():
         layout="wide"
     )
 
-    # Force clean crisp Light/White Theme Styling via CSS injections
+    # Custom Baby Pink Sidebar & White Content Styling
     st.markdown("""
         <style>
         .stApp {
             background-color: #FFFFFF;
             color: #111111;
         }
-        sidebar .stApp {
-            background-color: #F8F9FA;
+        /* Style the sidebar background with light baby pink */
+        [data-testid="stSidebar"] {
+            background-color: #FCE4EC !important;
+        }
+        [data-testid="stSidebar"] * {
+            color: #5A2A38 !important;
+        }
+        /* Style file uploader dropzone box to baby pink */
+        [data-testid="stFileUploader"] section {
+            background-color: #FCE4EC !important;
+            border: 2px dashed #F48FB1 !important;
         }
         h1, h2, h3, h4, h5, h6, p, label, span {
             color: #1A1A1A !important;
         }
         .stMetric {
-            background-color: #F1F3F5;
+            background-color: #FFF0F3;
             padding: 15px;
             border-radius: 8px;
-            border: 1px solid #E2E8F0;
+            border: 1px solid #F8BBD0;
         }
         </style>
     """, unsafe_allow_html=True)
@@ -237,7 +242,6 @@ def main():
 
     engine, eval_results = load_engine()
 
-    # Sidebar Navigation (Deployment guide removed as requested)
     st.sidebar.title("HRIDAYA Controls")
     app_mode = st.sidebar.radio("Navigate Workspace:", [
         "📊 Dashboard Overview",
@@ -262,7 +266,7 @@ def main():
             fig.patch.set_facecolor('white')
             ax.set_facecolor('white')
             sns.heatmap(
-                eval_results['confusion_matrix'], annot=True, fmt='d', cmap='Reds',
+                eval_results['confusion_matrix'], annot=True, fmt='d', cmap='RdPu',
                 xticklabels=['N', 'S', 'V', 'F', 'Q'], yticklabels=['N', 'S', 'V', 'F', 'Q'], ax=ax
             )
             ax.xaxis.label.set_color('black')
@@ -323,7 +327,7 @@ def main():
         
         if "Ventricular" in beat_choice:
             raw_wave += np.random.normal(0, 0.15, 188)
-            raw_wave[75:110] += 2.2  # Sharp PVC anomaly waveform
+            raw_wave[75:110] += 2.2
         elif "Supraventricular" in beat_choice:
             raw_wave += np.random.normal(0, 0.05, 188)
             raw_wave[60:85] += 1.1
