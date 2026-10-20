@@ -198,21 +198,18 @@ def main():
         layout="wide"
     )
 
-    # Custom Baby Pink Sidebar & White Content Styling
     st.markdown("""
         <style>
         .stApp {
             background-color: #FFFFFF;
             color: #111111;
         }
-        /* Style the sidebar background with light baby pink */
         [data-testid="stSidebar"] {
             background-color: #FCE4EC !important;
         }
         [data-testid="stSidebar"] * {
             color: #5A2A38 !important;
         }
-        /* Style file uploader dropzone box to baby pink */
         [data-testid="stFileUploader"] section {
             background-color: #FCE4EC !important;
             border: 2px dashed #F48FB1 !important;
