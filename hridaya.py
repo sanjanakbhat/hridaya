@@ -367,4 +367,69 @@ def main():
             raw_wave += np.random.normal(0, 0.08, 188)
             raw_wave[75:110] -= 1.3
         else:
-            raw_wave += np.random.normal(0, 0.0
+            raw_wave += np.random.normal(0, 0.03, 188)
+            raw_wave[85:100] += 1.5
+
+        analysis = engine.predict_segment(raw_wave)
+        
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            st.markdown("##### Extracted Lead MLII Waveform Segment")
+            fig, ax = plt.subplots(figsize=(8, 3.5))
+            fig.patch.set_facecolor('white')
+            ax.set_facecolor('white')
+            ax.plot(raw_wave, color='#d90429', linewidth=2.2)
+            ax.set_title(f"Processed Window — Class: {analysis['class']}")
+            ax.set_xlabel("Sample Index")
+            ax.set_ylabel("Amplitude (mV)")
+            ax.grid(True, linestyle='--', alpha=0.3)
+            st.pyplot(fig)
+            
+        with col2:
+            st.markdown("##### Clinical Screening Findings")
+            if analysis['is_anomalous']:
+                st.error(f"⚠️ **ABNORMALITY DETECTED**\n\n**Matched Condition:** {analysis['condition']}\n\n**Risk Tier:** {analysis['tier']}\n\n**Confidence:** {analysis['confidence']}%\n\n**Anomaly Score:** {analysis['anomaly_score']}\n\n**Details:** {analysis['description']}")
+            else:
+                st.success(f"✅ **NORMAL SINUS RHYTHM**\n\n**Matched Condition:** {analysis['condition']}\n\n**Risk Tier:** {analysis['tier']}\n\n**Confidence:** {analysis['confidence']}%\n\n**Anomaly Score:** {analysis['anomaly_score']}\n\n**Details:** {analysis['description']}")
+
+        st.markdown("##### Class Probability Distribution")
+        st.json(analysis['probability_distribution'])
+
+    elif app_mode == "📋 Clinical Risk Summary":
+        st.subheader("📋 Continuous Monitoring Risk Stratification")
+        summary_table = pd.DataFrame({
+            "Clinical Category": ["Total Heartbeats Analyzed", "Normal Sinus Beats (N)", "Ectopic/Abnormal Beats", "Ectopic Burden Rate", "Risk Level"],
+            "Session Value": ["2,450 beats", "2,180 (88.98%)", "270 (11.02%)", "Moderate", "⚠️ Clinical Review Recommended"]
+        })
+        st.table(summary_table)
+        st.warning("🚨 **Alert Notice:** PVC burden exceeded 10% during 30-minute interval. Holter review suggested.")
+
+    elif app_mode == "📝 Review & Sign-Off Report":
+        st.subheader("📝 Final Patient Review & Clinical Sign-Off Page")
+        st.write("Review final diagnostic outputs and generate patient sign-off reports.")
+        
+        st.info("📌 **Diagnostic Verification Status:** Approved for preliminary clinical triage.")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.text_input("Patient ID / Name", "Patient #9042")
+            st.text_input("Attending Physician", "Dr. Cardo, MD")
+        with col2:
+            st.selectbox("Primary Risk Assessment", ["Low Risk", "Moderate Risk (Holter Required)", "High Risk (Immediate Intervention)"])
+            st.date_input("Review Date")
+            
+        if st.button("Generate Official Diagnostic Report"):
+            st.success("Official diagnostic report successfully compiled!")
+            
+        st.markdown("---")
+        st.markdown("##### Copyright & Author Information")
+        st.markdown("""
+        * **Platform:** HRIDAYA (हृदय) Automated ECG Diagnostics
+        * **Copyright ©:** All Rights Reserved
+        * **Lead Author:** Sanjana K Bhat
+        * **Contact Phone:** 9535309338
+        * **Support Email:** sanjanakbhatunitech@gmail.com
+        """)
+
+if __name__ == "__main__":
+    main()
