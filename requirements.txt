@@ -8,3 +8,11 @@ streamlit
 wfdb
 matplotlib
 numpy
+streamlit>=1.66,<2
+numpy>=1.26
+pandas>=2.1
+matplotlib>=3.8
+seaborn>=0.13
+scipy>=1.11
+scikit-learn>=1.4
+wfdb>=4.1
