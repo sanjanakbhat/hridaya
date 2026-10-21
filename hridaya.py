@@ -2,27 +2,40 @@
 """
 HRIDAYA (हृदय) - Automated ECG Arrhythmia & Anomaly Diagnostic Hub
 Run:  streamlit run app.py --server.maxUploadSize 1000
+Keep logo.png in the same folder as app.py (the app shows it in the sidebar, home page and reports).
 
-Design rules (why this differs from the earlier two versions)
+Design rules
  * Every number shown is computed from the uploaded data. Nothing is hard-coded,
    "calibrated" or random-generated.
- * Beat classifier (AAMI N/S/V/F/Q) is trained and tested ONLY on beats from the
-   uploaded dataset's reference annotations (.atr). Accuracy = hold-out test accuracy.
+ * Beat classifier is trained and tested ONLY on labels that come with the upload
+   (WFDB .atr, PhysioNet annotation .txt, or the label column of beat-matrix CSVs).
  * The 13 conditions are screened with signal-processing rules on the uploaded ECG.
    Where the leads in the file cannot support a condition (e.g. LVH needs V1 + V5),
    the app says "Not assessable" instead of guessing.
  * Rule outputs are validated against the dataset's own annotations where those exist
    (AFib, 2nd-degree block, LBBB, RBBB) and the agreement table is shown.
  * Screening/research tool only - not a certified medical device.
+
+Accepted uploads (a .zip, or the individual files selected together)
+ 1. WFDB records: .hea + .dat/.mat (+ optional .atr)
+ 2. CSV/TXT signal + PhysioNet annotation text, e.g. 100.csv + 100annotations.txt
+    (paired automatically; a time column such as 0:00.003 gives the sampling rate)
+ 3. Pre-segmented beat CSVs (Kaggle mitbih_train.csv / mitbih_test.csv, last column 0-4):
+    classifier accuracy + confusion matrix only (no timing data -> no rhythm/PR/QT)
+ 4. CSV/TXT signal without annotations: 13-condition screening runs, accuracy cannot be computed
+ 5. Unknown sampling rate: set it in the sidebar
 """
 from __future__ import annotations
 
+import base64
 import datetime
 import html
 import os
+import re
 import shutil
 import tempfile
 import zipfile
+from collections import Counter
 from urllib.parse import quote_plus
 
 import matplotlib
@@ -48,11 +61,32 @@ except ImportError:  # pragma: no cover
 # ======================================================================
 # 0. CONSTANTS
 # ======================================================================
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
 OWNER = {
     "name": "Sanjana K Bhat",
     "phone": "9535309338",
     "email": "sanjanakbhatunitech@gmail.com",
 }
+
+
+def find_logo():
+    for p in ("logo.png", os.path.join("assets", "logo.png"), "Elegant_Devanagari_Heart_Emblem.png"):
+        fp = os.path.join(APP_DIR, p)
+        if os.path.isfile(fp):
+            return fp
+    return None
+
+
+LOGO = find_logo()
+
+
+def logo_b64():
+    if not LOGO:
+        return ""
+    with open(LOGO, "rb") as f:
+        return base64.b64encode(f.read()).decode()
+
 
 CONDITIONS = [
     dict(id=1, name="Atrial Fibrillation (AFib)", tier="Critical",
@@ -99,23 +133,43 @@ ANN_TO_AAMI = {s: c for c, syms in AAMI_CLASSES.items() for s in syms}
 BEAT_SYMBOLS = set(ANN_TO_AAMI)               # annotation symbols treated as beats
 NORMAL_CONDUCTED = {"N", "L", "R", "e", "j"}  # used for PR/QRS/ST/QT measurement
 AAMI_ORDER = ["N", "S", "V", "F", "Q"]
+CLASS_ORDER = AAMI_ORDER + ["Normal", "Abnormal"]
+
+SIG_TITLE = "Annotated ECG records (waveform + RR features)"
+SCHEME_TITLE = {
+    "mitbih": "Pre-segmented beat files (labels 0-4 = N, S, V, F, Q)",
+    "ptbdb": "Pre-segmented beat files (PTB-DB: 0 = Normal, 1 = Abnormal)",
+}
+AAMI_LABEL_NAMES = {0: "N", 1: "S", 2: "V", 3: "F", 4: "Q"}
+STD_FS = (100, 125, 128, 200, 250, 256, 360, 500, 512, 1000, 2000)
+IGNORE_PREFIX = ("readme", "license", "records", "sha256", "annotators", "index", "changelog")
 
 DOCTORS = [
-    dict(name="Dr. Nagamani A. C.", exp="23 Years", spec="MBBS, DM - Cardiology",
+    dict(city="Bengaluru", name="Dr. Nagamani A. C.", exp="23 Years", spec="MBBS, DM - Cardiology",
          loc="Apollo Clinic, Koramangala, Bengaluru"),
-    dict(name="Dr. Anusha A. Rao", exp="8 Years", spec="MBBS, MD, DNB (Cardiology)",
+    dict(city="Bengaluru", name="Dr. Anusha A. Rao", exp="8 Years", spec="MBBS, MD, DNB (Cardiology)",
          loc="Manipal Hospitals Old Airport Road / Apollo Clinic, Indiranagar, Bengaluru"),
-    dict(name="Dr. Shilpa Jayaprakash", exp="12 Years", spec="MBBS, MD General Medicine, DM Cardiology",
+    dict(city="Bengaluru", name="Dr. Shilpa Jayaprakash", exp="12 Years", spec="MBBS, MD General Medicine, DM Cardiology",
          loc="Apollo Clinic, JP Nagar, Bengaluru"),
-    dict(name="Dr. K. Nikhitha Reddy (Dr. K. Nikhitha)", exp="12 Years", spec="MBBS, MD General Medicine, DM Cardiology",
+    dict(city="Bengaluru", name="Dr. K. Nikhitha Reddy (Dr. K. Nikhitha)", exp="12 Years", spec="MBBS, MD General Medicine, DM Cardiology",
          loc="Apollo Clinic, HSR Layout, Bengaluru"),
-    dict(name="Dr. Disha R. Shetty", exp="8 Years", spec="MBBS, MD, DM Cardiology",
+    dict(city="Bengaluru", name="Dr. Disha R. Shetty", exp="8 Years", spec="MBBS, MD, DM Cardiology",
          loc="Apollo One, Electronic City, Bengaluru"),
+    dict(city="Mumbai", name="Dr. Dhairya Thakker", exp="Not listed - confirm with the clinic",
+         spec="Consultant Cardiologist (qualifications not listed - verify with the clinic / medical council)",
+         loc="Visiting consultant at multi-specialty centres, clinics and tertiary-care networks - Mulund & Northeast Mumbai",
+         note=("He practises as a visiting consultant rather than from one flagship hospital, so his OPD days rotate between "
+               "regional centres. Confirm the chamber location and live availability before visiting. For inpatient or advanced "
+               "cardiac investigations, regional cardiologists often hold panel or visiting rights at hospitals such as "
+               "Platinum Hospital Mulund and Fortis Hospital Mulund - ask the cardiology desk whether he consults there."),
+         links=[("🩺 MyMedisage profile", "https://mymedisage.com/profile/dr-dhairya-thakker"),
+                ("🏥 Platinum Hospital Mulund", "https://www.google.com/maps/search/?api=1&query=" + quote_plus("Platinum Hospital Mulund")),
+                ("🏥 Fortis Hospital Mulund", "https://www.google.com/maps/search/?api=1&query=" + quote_plus("Fortis Hospital Mulund"))]),
 ]
 
 
 # ======================================================================
-# 1. SIGNAL LOADING
+# 1. SIGNAL LOADING (WFDB, CSV/TXT signal, annotation text, beat matrices)
 # ======================================================================
 def _fill_nans(x):
     x = np.asarray(x, dtype=float).copy()
@@ -126,6 +180,63 @@ def _fill_nans(x):
         idx = np.arange(len(x))
         x[bad] = np.interp(idx[bad], idx[~bad], x[~bad])
     return x
+
+
+def _is_float(s):
+    try:
+        float(s)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _strip_q(s):
+    return str(s).strip().strip("'\"").strip()
+
+
+def _time_to_s(v):
+    """'0:00.003' / '1:02:03.5' / '12.5' -> seconds (NaN when not a time)."""
+    v = _strip_q(v)
+    if _is_float(v):
+        return float(v)
+    try:
+        secs = 0.0
+        for p in v.split(":"):
+            secs = secs * 60 + float(p)
+        return secs
+    except ValueError:
+        return np.nan
+
+
+def _snap_fs(fs):
+    if fs is None or not np.isfinite(fs) or fs <= 0:
+        return None
+    best = min(STD_FS, key=lambda s: abs(s - fs))
+    return float(best) if abs(best - fs) / best < 0.03 else float(round(fs, 2))
+
+
+def estimate_fs_from_time(series):
+    n = len(series)
+    if n < 10:
+        return None
+    idx = np.unique(np.linspace(0, n - 1, min(n, 2000)).astype(int))
+    t = np.array([_time_to_s(v) for v in series.iloc[idx]], dtype=float)
+    ok = np.isfinite(t)
+    if ok.sum() < 3:
+        return None
+    t, ii = t[ok], idx[ok]
+    if t[-1] <= t[0]:
+        return None
+    return _snap_fs((ii[-1] - ii[0]) / (t[-1] - t[0]))
+
+
+def build_rhythm(samples, symbols, notes, n):
+    marks = [(int(s), str(a).replace("\x00", "").strip().lstrip("(")) for s, sym, a in zip(samples, symbols, notes) if sym == "+"]
+    out = []
+    for k, (s, lab) in enumerate(marks):
+        end = marks[k + 1][0] if k + 1 < len(marks) else n
+        out.append((s, end, lab))
+    return out
 
 
 def load_wfdb_record(base):
@@ -147,48 +258,181 @@ def load_wfdb_record(base):
             cal.append(True)
         else:
             cal.append(False)
-    out = dict(signal=sig, fs=float(rec.fs), sig_names=list(rec.sig_name), calibrated=cal,
-               ann_samples=None, ann_symbols=None, rhythm=[])
+    out = dict(kind="signal", signal=sig, fs=float(rec.fs), fs_source="WFDB header", sig_names=list(rec.sig_name),
+               calibrated=cal, ann_samples=None, ann_symbols=None, rhythm=[])
     try:
         ann = wfdb.rdann(base, "atr")
         out["ann_samples"] = np.asarray(ann.sample, dtype=int)
         out["ann_symbols"] = np.asarray(ann.symbol)
         notes = list(ann.aux_note) if ann.aux_note is not None else [""] * len(ann.symbol)
-        marks = [(int(s), str(n).replace("\x00", "").strip().lstrip("(")) for s, sym, n in
-                 zip(ann.sample, ann.symbol, notes) if sym == "+"]
-        for k, (s, lab) in enumerate(marks):
-            end = marks[k + 1][0] if k + 1 < len(marks) else sig.shape[0]
-            out["rhythm"].append((s, end, lab))
+        out["rhythm"] = build_rhythm(ann.sample, ann.symbol, notes, sig.shape[0])
     except Exception:
         pass
     return out
 
 
-def load_csv_record(path, fs, units):
-    df = pd.read_csv(path)
-    if all(_is_float(c) for c in df.columns):
-        df = pd.read_csv(path, header=None)
-    drop = [c for c in df.columns if any(k in str(c).lower() for k in ("time", "sample", "index", "unnamed"))]
-    num = df.drop(columns=drop, errors="ignore").select_dtypes(include=[np.number])
+# ---- text / CSV helpers ------------------------------------------------
+ANN_RE = re.compile(r"^\s*(\S+)\s+(\d+)\s+(\S+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s*(.*)$")
+
+
+def _first_lines(path, n=6):
+    try:
+        with open(path, "r", errors="ignore") as f:
+            return [f.readline() for _ in range(n)]
+    except OSError:
+        return []
+
+
+def looks_like_annotation(path):
+    """PhysioNet annotation text ('Time  Sample #  Type  Sub  Chan  Num  Aux') or a CSV with sample/type columns."""
+    for ln in _first_lines(path):
+        low = ln.lower()
+        if "sample" in low and ("type" in low or "symbol" in low):
+            return True
+        m = ANN_RE.match(ln)
+        if m and "," not in ln and not _is_float(m.group(3)):
+            return True
+    return False
+
+
+def parse_annotation_file(path):
+    with open(path, "r", errors="ignore") as f:
+        lines = f.read().splitlines()
+    samples, symbols, notes, times = [], [], [], []
+    head = next((ln for ln in lines if ln.strip()), "")
+    if "," in head and not ANN_RE.match(head):  # CSV-style annotation table
+        df = pd.read_csv(path)
+        cols = {_strip_q(c).lower(): c for c in df.columns}
+        sc = next((cols[k] for k in cols if k.startswith("sample")), None)
+        tc = next((cols[k] for k in cols if k in ("type", "symbol", "label", "beat", "annotation")), None)
+        ac = next((cols[k] for k in cols if k in ("aux", "note", "rhythm")), None)
+        if sc is None or tc is None:
+            raise ValueError("annotation CSV needs 'sample' and 'type' columns")
+        samples = pd.to_numeric(df[sc], errors="coerce").fillna(-1).astype(int).tolist()
+        symbols = df[tc].astype(str).str.strip().tolist()
+        notes = df[ac].fillna("").astype(str).tolist() if ac else [""] * len(samples)
+        times = None
+    else:
+        for ln in lines:
+            m = ANN_RE.match(ln)
+            if m and not _is_float(m.group(3)):
+                times.append(_time_to_s(m.group(1)))
+                samples.append(int(m.group(2)))
+                symbols.append(m.group(3))
+                notes.append(m.group(7).strip())
+    if not samples:
+        raise ValueError("no annotation rows could be parsed")
+    order = np.argsort(samples, kind="stable")
+    samples = np.asarray(samples, dtype=int)[order]
+    symbols = np.asarray(symbols)[order]
+    notes = [notes[i] for i in order]
+    t = np.asarray(times, dtype=float)[order] if times is not None else None
+    return dict(samples=samples, symbols=symbols, notes=notes, times=t)
+
+
+def fs_from_annotation(ann):
+    t = ann.get("times")
+    if t is None:
+        return None
+    ok = np.isfinite(t) & (t > 1.0)
+    if ok.sum() < 3:
+        return None
+    return _snap_fs(float(np.median(ann["samples"][ok] / t[ok])))
+
+
+def _read_table(path):
+    line = next((ln for ln in _first_lines(path, 5) if ln.strip()), "")
+    sep = next((s for s in (",", ";", "\t") if s in line), r"\s+")
+    kw = dict(sep=sep, engine="python") if sep == r"\s+" else dict(sep=sep)
+    first = pd.read_csv(path, nrows=1, header=None, **kw)
+    headerless = all(_is_float(_strip_q(v)) for v in first.iloc[0].tolist())
+    df = pd.read_csv(path, header=None if headerless else 0, **kw)
+    df.columns = [_strip_q(c) for c in df.columns]
+    return df
+
+
+def make_beat_matrix(num, path):
+    """Pre-segmented beats: one beat per row, last column = class label."""
+    lab = num.iloc[:, -1].values.astype(float)
+    M = num.iloc[:, :-1].values.astype(float)
+    ok = np.isfinite(lab) & (lab == np.round(lab))
+    if ok.mean() < 0.99 or np.nanmax(lab) > 4 or np.nanmin(lab) < 0:
+        raise ValueError("looks like a pre-segmented beat file, but its last column is not a 0-4 class label")
+    lab, M = lab[ok].astype(int), np.nan_to_num(M[ok])
+    low = os.path.basename(path).lower()
+    if "ptbdb" in low:
+        if lab.max() > 1:
+            raise ValueError("PTB-DB beat file should have labels 0/1 only")
+        scheme, names = "ptbdb", {0: "Normal", 1: "Abnormal"}
+    else:
+        scheme, names = "mitbih", AAMI_LABEL_NAMES
+    role = "test" if "test" in low else ("train" if "train" in low else "all")
+    return dict(kind="beats", X=M, y=np.array([names[i] for i in lab]), scheme=scheme, role=role)
+
+
+def load_csv_record(path, ann_path, opts):
+    df = _read_table(path)
+    names = list(df.columns)
+    low = [n.lower() for n in names]
+    time_col = next((n for n, l in zip(names, low) if "time" in l or "elapsed" in l or "interval" in l), None)
+    idx_cols = [n for n, l in zip(names, low)
+                if n != time_col and (l.startswith("sample") or l in ("index", "idx", "#") or l.startswith("unnamed"))]
+    data_cols = [n for n in names if n != time_col and n not in idx_cols]
+    if not data_cols:
+        raise ValueError("no numeric ECG columns")
+
+    # optional units row, e.g. 'hh:mm:ss.mmm','mV','mV'
+    unit_of = {}
+    if len(df) > 1 and all(not _is_float(_strip_q(v)) for v in df.iloc[0][data_cols]):
+        unit_of = {c: _strip_q(v).lower().replace("µ", "u").replace("μ", "u") for c, v in df.iloc[0][data_cols].items()}
+        df = df.iloc[1:].reset_index(drop=True)
+
+    num = df[data_cols].apply(pd.to_numeric, errors="coerce")
+    num = num.dropna(axis=1, how="all")
     if num.shape[1] == 0:
         raise ValueError("no numeric ECG columns")
-    if num.shape[1] >= 150 and num.shape[0] > 50:
-        raise ValueError("looks like a pre-segmented beat matrix (no rhythm/PR/QT analysis possible)")
+    if num.shape[1] >= 100 and len(num) >= 20:
+        return make_beat_matrix(num, path)
+
     num = num.iloc[:, :12]
     sig = np.column_stack([_fill_nans(num.iloc[:, i].values) for i in range(num.shape[1])])
-    cal = [units != "arbitrary"] * sig.shape[1]
-    if units == "µV":
-        sig = sig / 1000.0
-    return dict(signal=sig, fs=float(fs), sig_names=[str(c) for c in num.columns], calibrated=cal,
-                ann_samples=None, ann_symbols=None, rhythm=[])
+    cal = []
+    for i, c in enumerate(num.columns):
+        u = unit_of.get(c)
+        if u is None:
+            u = {"mV": "mv", "µV": "uv", "arbitrary": ""}[opts["csv_units"]]
+        if u == "mv":
+            cal.append(True)
+        elif u == "uv":
+            sig[:, i] = sig[:, i] / 1000.0
+            cal.append(True)
+        elif u == "v":
+            sig[:, i] = sig[:, i] * 1000.0
+            cal.append(True)
+        else:
+            cal.append(False)
 
+    ann = parse_annotation_file(ann_path) if ann_path else None
+    fs, src = None, ""
+    if not opts.get("force_fs"):
+        if time_col is not None:
+            fs = estimate_fs_from_time(df[time_col])
+            src = f"time column '{time_col}'"
+        if fs is None and ann is not None:
+            fs = fs_from_annotation(ann)
+            src = "annotation Sample#/Time ratio"
+    if fs is None:
+        fs, src = float(opts["csv_fs"]), "sidebar setting"
 
-def _is_float(s):
-    try:
-        float(s)
-        return True
-    except (TypeError, ValueError):
-        return False
+    out = dict(kind="signal", signal=sig, fs=float(fs), fs_source=src, sig_names=[str(c) for c in num.columns],
+               calibrated=cal, ann_samples=None, ann_symbols=None, rhythm=[])
+    if ann is not None:
+        ok = (ann["samples"] >= 0) & (ann["samples"] < sig.shape[0])
+        out["ann_samples"] = ann["samples"][ok]
+        out["ann_symbols"] = ann["symbols"][ok]
+        notes = [n for n, k in zip(ann["notes"], ok) if k]
+        out["rhythm"] = build_rhythm(out["ann_samples"], out["ann_symbols"], notes, sig.shape[0])
+    return out
 
 
 def pick_leads(names):
@@ -331,7 +575,6 @@ def measure_beat(xf, fs, r, prev_r=None, next_r=None):
         p_amp = float(seg[kk] - iso)
         if 0 < kk < len(seg) - 1 and p_amp >= 0.05 * ref_amp and seg[kk] >= seg[kk - 1] and seg[kk] >= seg[kk + 1]:
             p_idx = a + kk
-            p_on = _walk(xf - (iso + 0.2 * p_amp), p_idx, -1, 0.0, int(0.12 * fs), run=1) if False else p_idx
             j = p_idx
             while j > a and xf[j] > iso + 0.2 * p_amp and p_idx - j < int(0.12 * fs):
                 j -= 1
@@ -391,7 +634,8 @@ def analyze_record(rec, name, max_beats=300):
     samples, symbols = get_beats(rec, x, fs)
     annotated = symbols is not None
 
-    res = dict(name=name, fs=fs, duration_s=sig.shape[0] / fs, leads=", ".join(map(str, names)),
+    res = dict(name=name, fs=fs, fs_source=rec.get("fs_source", ""), duration_s=sig.shape[0] / fs,
+               leads=", ".join(map(str, names)),
                main_lead=str(names[main]), n_beats=int(len(samples)), has_ann=annotated,
                class_counts={}, hr_med=np.nan, hr_min=np.nan, hr_max=np.nan, rr_cv=np.nan,
                qrs_ms=np.nan, pr_ms=np.nan, p_ratio=np.nan, qtc_ms=np.nan, st_mv={}, sokolow=np.nan,
@@ -410,6 +654,8 @@ def analyze_record(rec, name, max_beats=300):
 
     rr = np.diff(samples) / fs
     valid = (rr > 0.25) & (rr < 3.0)
+    if valid.sum() < 5:
+        return res
     hr = 60.0 / rr[valid]
     hr_med = float(np.median(hr))
     res.update(hr_med=hr_med, hr_min=float(np.percentile(hr, 2)), hr_max=float(np.percentile(hr, 98)),
@@ -622,9 +868,18 @@ def analyze_record(rec, name, max_beats=300):
 
 
 # ======================================================================
-# 4. BEAT CLASSIFIER (AAMI N/S/V/F/Q)  - trained on uploaded annotations
+# 4. BEAT CLASSIFIER
 # ======================================================================
+def _stats_block(seg, z):
+    g = np.gradient(z, axis=1)
+    h = z.shape[1] // 2
+    return np.column_stack([seg.mean(1), seg.std(1), seg.max(1), seg.min(1), np.ptp(seg, axis=1),
+                            g.mean(1), g.std(1), g.max(1), g.min(1),
+                            z[:, :h].std(1), z[:, h:].std(1), np.abs(z[:, h:]).mean(1)])
+
+
 def beat_feature_matrix(x, fs, samples):
+    """Features for beats cut out of a continuous record (waveform + local RR context)."""
     pre, post = int(round(0.25 * fs)), int(round(0.27 * fs))
     L = pre + post
     ok = (samples - pre >= 0) & (samples + post <= len(x))
@@ -638,22 +893,26 @@ def beat_feature_matrix(x, fs, samples):
     seg = seg[:, lo] * (1 - fr) + seg[:, hi] * fr
     mean, std = seg.mean(1, keepdims=True), seg.std(1, keepdims=True)
     z = (seg - mean) / np.where(std > 0, std, 1.0)
-    g = np.gradient(z, axis=1)
-    h = z.shape[1] // 2
     rr = np.diff(samples) / fs
     loc = pd.Series(rr).rolling(11, center=True, min_periods=1).median().values
     loc_b = np.r_[loc, loc[-1]]
     prev = np.r_[loc_b[0], rr]
     nxt = np.r_[rr, loc_b[-1]]
     rrf = np.column_stack([prev, nxt, prev / loc_b, nxt / loc_b, loc_b])[ok]
-    stats = np.column_stack([mean[:, 0], std[:, 0], seg.max(1), seg.min(1), np.ptp(seg, axis=1),
-                             g.mean(1), g.std(1), g.max(1), g.min(1),
-                             z[:, :h].std(1), z[:, h:].std(1), np.abs(z[:, h:]).mean(1)])
-    return np.hstack([z, stats, rrf]), ok
+    return np.hstack([z, _stats_block(seg, z), rrf]), ok
+
+
+def matrix_feature_matrix(M):
+    """Features for pre-segmented beat rows (waveform only - no timing context in these files)."""
+    M = np.nan_to_num(np.asarray(M, dtype=float))
+    mean, std = M.mean(1, keepdims=True), M.std(1, keepdims=True)
+    z = (M - mean) / np.where(std > 0, std, 1.0)
+    return np.hstack([z, _stats_block(M, z)])
 
 
 def metrics_from_pred(y_true, y_pred):
-    labels = [c for c in AAMI_ORDER if c in set(y_true) | set(y_pred)]
+    present = set(y_true) | set(y_pred)
+    labels = [c for c in CLASS_ORDER if c in present] + sorted(present - set(CLASS_ORDER))
     cm = confusion_matrix(y_true, y_pred, labels=labels)
     rep = classification_report(y_true, y_pred, labels=labels, output_dict=True, zero_division=0)
     sens, spec = [], []
@@ -672,24 +931,41 @@ def metrics_from_pred(y_true, y_pred):
                 cm=cm, labels=labels, report=rep, n_test=int(len(y_true)))
 
 
-def train_and_evaluate(X, y, groups, n_trees=150, patient_wise=True):
+def train_and_evaluate(X, y, groups, n_trees=150, patient_wise=True, presplit=None):
+    """presplit=(X_test, y_test) uses the files' own train/test split; otherwise a stratified 80/20 split."""
     notes = []
-    counts = pd.Series(y).value_counts()
-    rare = counts[counts < 10].index.tolist()
-    if rare:
-        keep = ~np.isin(y, rare)
-        X, y, groups = X[keep], y[keep], groups[keep]
-        notes.append(f"Classes with fewer than 10 beats were excluded from evaluation: {', '.join(rare)}")
-    if len(set(y)) < 2:
-        return None
-    X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.20, random_state=42, stratify=y)
+    if presplit is None:
+        counts = pd.Series(y).value_counts()
+        rare = counts[counts < 10].index.tolist()
+        if rare:
+            keep = ~np.isin(y, rare)
+            X, y, groups = X[keep], y[keep], groups[keep]
+            notes.append(f"Classes with fewer than 10 beats were excluded from evaluation: {', '.join(rare)}")
+        if len(set(y)) < 2:
+            return None
+        X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.20, random_state=42, stratify=y)
+        split_desc = "Beat-level stratified 80/20 split"
+    else:
+        X_tr, y_tr = X, y
+        X_te, y_te = presplit
+        counts = pd.Series(y_tr).value_counts()
+        rare = counts[counts < 10].index.tolist()
+        if rare:
+            keep = ~np.isin(y_tr, rare)
+            X_tr, y_tr = X_tr[keep], y_tr[keep]
+            notes.append(f"Classes with fewer than 10 training beats were excluded: {', '.join(rare)}")
+        m = np.isin(y_te, np.unique(y_tr))
+        X_te, y_te = X_te[m], y_te[m]
+        if len(set(y_tr)) < 2 or len(y_te) == 0:
+            return None
+        split_desc = "Official train/test files (trained on the train file, scored on the unseen test file)"
     clf = RandomForestClassifier(n_estimators=n_trees, max_depth=25, min_samples_split=4,
                                  class_weight="balanced_subsample", random_state=42, n_jobs=-1)
     clf.fit(X_tr, y_tr)
     out = metrics_from_pred(y_te, clf.predict(X_te))
-    out.update(n_train=int(len(y_tr)), class_counts={k: int(v) for k, v in pd.Series(y).value_counts().items()},
-               notes=notes, patient=None)
-    if patient_wise and len(set(groups)) >= 4:
+    out.update(n_train=int(len(y_tr)), class_counts={k: int(v) for k, v in pd.Series(np.r_[y_tr, y_te]).value_counts().items()},
+               notes=notes, patient=None, split_desc=split_desc)
+    if presplit is None and patient_wise and groups is not None and len(set(groups)) >= 4:
         gss = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=42)
         tr, te = next(gss.split(X, y, groups))
         if len(set(y[tr])) >= 2 and len(te) > 0:
@@ -717,42 +993,93 @@ def safe_extract(uploaded, dest):
             zf.extract(m, dest)
 
 
+def ingest_uploads(files, dest):
+    """Accepts .zip archives and/or loose files (csv, txt, hea, dat, atr, mat)."""
+    for f in files:
+        if f.name.lower().endswith(".zip"):
+            safe_extract(f, dest)
+        else:
+            name = os.path.basename(f.name)
+            with open(os.path.join(dest, name), "wb") as out:
+                out.write(f.getbuffer())
+
+
+def _norm_stem(stem, ann=False):
+    s = stem.lower()
+    if ann:
+        for tok in ("annotations", "annotation", "annot", "atr", "ann", "labels", "label"):
+            s = s.replace(tok, "")
+    for ch in ("_", "-", " ", "."):
+        s = s.replace(ch, "")
+    return s
+
+
 def discover_records(root):
-    recs = {}
+    """Returns {key: (kind, path, annotation_path_or_None)}; pairs 100.csv with 100annotations.txt automatically."""
+    wf, sig_files, ann_files = {}, [], []
     for d, _, files in os.walk(root):
         if "__MACOSX" in d:
             continue
         for f in sorted(files):
             low = f.lower()
-            if low.endswith(".hea"):
-                kind, base = "wfdb", os.path.join(d, f[:-4])
-            elif low.endswith((".csv", ".txt")):
-                kind, base = "csv", os.path.join(d, f)
-            else:
+            if f.startswith("._") or low.startswith(IGNORE_PREFIX):
                 continue
-            key = os.path.splitext(f)[0]
-            if key in recs:
-                key = f"{os.path.basename(d)}/{key}"
-            recs[key] = (kind, base)
+            full = os.path.join(d, f)
+            if low.endswith(".hea"):
+                wf[(d, f[:-4])] = full[:-4]
+            elif low.endswith((".csv", ".txt")):
+                (ann_files if looks_like_annotation(full) else sig_files).append((d, f, full))
+    recs = {}
+    for (d, stem), base in wf.items():
+        key = stem if stem not in recs else f"{os.path.basename(d)}/{stem}"
+        recs[key] = ("wfdb", base, None)
+    for d, f, full in sig_files:
+        stem = os.path.splitext(f)[0]
+        if (d, stem) in wf:
+            continue
+        ns = _norm_stem(stem)
+        cand = [a for a in ann_files if a[0] == d and _norm_stem(os.path.splitext(a[1])[0], True) == ns]
+        cand = cand or [a for a in ann_files if _norm_stem(os.path.splitext(a[1])[0], True) == ns]
+        if cand:
+            ann = cand[0][2]
+        elif len(sig_files) == 1 and len(ann_files) == 1:
+            ann = ann_files[0][2]
+        else:
+            ann = None
+        key = stem if stem not in recs else f"{os.path.basename(d)}/{stem}"
+        recs[key] = ("csv", full, ann)
     return recs
 
 
-def load_any(kind, path, opts):
+def load_any(kind, path, ann, opts):
     if kind == "wfdb":
         if not WFDB_OK:
             raise RuntimeError("wfdb is not installed")
         return load_wfdb_record(path)
-    return load_csv_record(path, opts["csv_fs"], opts["csv_units"])
+    return load_csv_record(path, ann, opts)
+
+
+def _cap_idx(n, cap, seed=42):
+    if n <= cap:
+        return np.arange(n)
+    return np.sort(np.random.RandomState(seed).choice(n, cap, replace=False))
 
 
 def run_pipeline(recs, opts, dataset_name):
-    per, skipped = {}, {}
+    per, skipped, beat_files = {}, {}, {}
     X_all, y_all, g_all = [], [], []
-    bar = st.progress(0.0, text="Analysing records...")
-    for k, (name, (kind, path)) in enumerate(recs.items()):
-        bar.progress((k + 1) / max(1, len(recs)), text=f"Analysing record {name} ({k + 1}/{len(recs)})")
+    mats = {}
+    bar = st.progress(0.0, text="Analysing files...")
+    for k, (name, (kind, path, ann)) in enumerate(recs.items()):
+        bar.progress((k + 1) / max(1, len(recs)), text=f"Analysing {name} ({k + 1}/{len(recs)})")
         try:
-            rec = load_any(kind, path, opts)
+            rec = load_any(kind, path, ann, opts)
+            if rec.get("kind") == "beats":
+                s = mats.setdefault(rec["scheme"], dict(train=[], test=[], all=[]))
+                s[rec["role"]].append((rec["X"], rec["y"]))
+                beat_files[name] = {"File": name, "Type": SCHEME_TITLE[rec["scheme"]], "Role": rec["role"],
+                                    "Beats": len(rec["y"]), "Class counts": str(dict(Counter(rec["y"])))}
+                continue
             if rec["signal"].shape[0] < rec["fs"] * 5:
                 raise ValueError("record shorter than 5 s")
             res = analyze_record(rec, name)
@@ -766,28 +1093,49 @@ def run_pipeline(recs, opts, dataset_name):
                     X_all.append(feats)
                     y_all.extend([ANN_TO_AAMI[s] for s in sym[ok]])
                     g_all.extend([k] * int(ok.sum()))
-        except Exception as e:  # keep going - one bad record must not kill the run
+        except Exception as e:  # keep going - one bad file must not kill the run
             skipped[name] = f"{type(e).__name__}: {e}"
     bar.empty()
 
-    ml, ml_msg = None, None
+    ml_all = {}
     if X_all:
-        X = np.vstack(X_all)
-        y = np.array(y_all)
-        g = np.array(g_all)
-        if len(y) > opts["max_beats"]:
-            rng = np.random.RandomState(42)
-            sel = np.sort(rng.choice(len(y), opts["max_beats"], replace=False))
-            X, y, g = X[sel], y[sel], g[sel]
+        X, y, g = np.vstack(X_all), np.array(y_all), np.array(g_all)
+        sel = _cap_idx(len(y), opts["max_beats"])
+        X, y, g = X[sel], y[sel], g[sel]
         if len(y) >= 200:
-            with st.spinner(f"Training and testing beat classifier on {len(y):,} annotated beats..."):
-                ml = train_and_evaluate(X, y, g, patient_wise=opts["patient_wise"])
-        if ml is None:
-            ml_msg = "Not enough annotated beats / classes to train and test a classifier."
-    else:
-        ml_msg = ("No reference annotations (.atr) were found, so classification accuracy cannot be computed. "
-                  "The 13-condition rule screening below still ran on the raw signals.")
-    return dict(per=per, skipped=skipped, ml=ml, ml_msg=ml_msg, dataset=dataset_name,
+            with st.spinner(f"Training and testing on {len(y):,} annotated beats from the signal records..."):
+                res = train_and_evaluate(X, y, g, patient_wise=opts["patient_wise"])
+            if res:
+                ml_all[SIG_TITLE] = res
+    for scheme, parts in mats.items():
+        title = SCHEME_TITLE[scheme]
+        with st.spinner(f"Training and testing on beat files: {title}..."):
+            if parts["train"] and parts["test"]:
+                Xtr = np.vstack([p[0] for p in parts["train"]])
+                ytr = np.concatenate([p[1] for p in parts["train"]])
+                Xte = np.vstack([p[0] for p in parts["test"]])
+                yte = np.concatenate([p[1] for p in parts["test"]])
+                i1, i2 = _cap_idx(len(ytr), opts["max_beats"]), _cap_idx(len(yte), opts["max_beats"])
+                res = train_and_evaluate(matrix_feature_matrix(Xtr[i1]), ytr[i1], None,
+                                         presplit=(matrix_feature_matrix(Xte[i2]), yte[i2]), patient_wise=False)
+            else:
+                allp = parts["all"] + parts["train"] + parts["test"]
+                Xm = np.vstack([p[0] for p in allp])
+                ym = np.concatenate([p[1] for p in allp])
+                i1 = _cap_idx(len(ym), opts["max_beats"])
+                res = train_and_evaluate(matrix_feature_matrix(Xm[i1]), ym[i1], np.zeros(len(i1), int), patient_wise=False)
+        if res:
+            ml_all[title] = res
+
+    ml = next(iter(ml_all.values())) if ml_all else None
+    ml_msg = None
+    if not ml_all:
+        if per:
+            ml_msg = ("No reference annotations (.atr, annotation .txt) or labelled beat files were found, so classification accuracy "
+                      "cannot be computed. The 13-condition rule screening below still ran on the raw signals.")
+        else:
+            ml_msg = "Not enough labelled beats / classes to train and test a classifier."
+    return dict(per=per, skipped=skipped, ml=ml, ml_all=ml_all, ml_msg=ml_msg, beat_files=beat_files, dataset=dataset_name,
                 recs={n: recs[n] for n in per}, time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
 
 
@@ -856,7 +1204,7 @@ def plot_confusion(cm, labels, title):
     axes[1].set_title(f"{title} - row-normalised (sensitivity)")
     for a in axes:
         a.set_xlabel("Predicted class")
-        a.set_ylabel("True class (reference annotation)")
+        a.set_ylabel("True class (reference label)")
     fig.tight_layout()
     return fig
 
@@ -897,6 +1245,7 @@ CSS = """
 [data-testid="stHeader"] { background:var(--maroon); }
 [data-testid="stSidebar"] { background:var(--beige); }
 [data-testid="stSidebar"] * { color:var(--brown); }
+[data-testid="stSidebar"] img { border-radius:12px; }
 [data-testid="stFileUploader"] section { background:#FFFFFF; border:2px dashed var(--gold); }
 .stButton>button,.stDownloadButton>button { background:var(--maroon); color:#FFFFFF; border:0; border-radius:10px; }
 .stButton>button:hover,.stDownloadButton>button:hover { background:#6E171B; color:#FFFFFF; }
@@ -919,18 +1268,19 @@ def footer():
 
 def results_or_warn():
     r = st.session_state.get("results")
+    if r and not r["per"] and r.get("ml_all"):
+        st.warning("⚠️ The uploaded data contains only pre-segmented beats (no continuous signal), so rhythm / PR / QRS / QT screening is not possible. "
+                   "Upload raw signal records (WFDB or CSV with time/sample data) to use this page.")
+        footer()
+        return None
     if not r or not r["per"]:
-        st.warning("⚠️ Upload a dataset ZIP on **📁 MIT-BIH / ECG Zip Upload** and click **Run full analysis** first.")
+        st.warning("⚠️ Upload ECG data on **📁 ECG Data Upload** and click **Run full analysis** first.")
         footer()
         return None
     return r
 
 
-def show_ml(ml, ml_msg):
-    st.markdown("### 🎯 Classification accuracy (computed from the uploaded readings)")
-    if ml is None:
-        st.warning(ml_msg or "Classifier could not be evaluated.")
-        return
+def show_ml_one(ml):
     if ml["patient"]:
         p = ml["patient"]
         st.markdown("**Primary result - patient-wise split (test records never seen in training)**")
@@ -939,7 +1289,7 @@ def show_ml(ml, ml_msg):
         q2.metric("Macro F1 (unseen records)", f"{p['macro_f1'] * 100:.2f}%")
         q3.metric("Unseen test records", p["n_test_records"])
         st.caption("This is the figure that reflects generalisation. The beat-level figure below can be optimistic because beats from the same recording appear in both train and test.")
-        st.markdown("**Beat-level stratified split (secondary)**")
+        st.markdown("**Beat-level split (secondary)**")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Hold-out accuracy", f"{ml['accuracy'] * 100:.2f}%")
     c2.metric("Macro F1", f"{ml['macro_f1'] * 100:.2f}%")
@@ -956,24 +1306,37 @@ def show_ml(ml, ml_msg):
                  "The figure is reported as measured - see notes below for likely causes.")
     for n in ml["notes"]:
         st.caption(n)
-    st.caption(f"Beat-level stratified 80/20 split ({ml['n_train']:,} train / {ml['n_test']:,} test). "
-               f"Class mix: {ml['class_counts']}. Accuracy is dominated by normal beats - check macro F1 and per-class recall too.")
-    st.markdown("### 🧮 Confusion matrix (hold-out test beats)")
+    st.caption(f"{ml['split_desc']} ({ml['n_train']:,} train / {ml['n_test']:,} test). "
+               f"Class mix: {ml['class_counts']}. Accuracy is dominated by the majority class - check macro F1 and per-class recall too.")
+    st.markdown("**🧮 Confusion matrix (hold-out test beats)**")
     fig = plot_confusion(ml["cm"], ml["labels"], "Beat classifier")
     st.pyplot(fig)
     plt.close(fig)
     rep = pd.DataFrame(ml["report"]).T
     rep = rep.loc[[i for i in rep.index if i in ml["labels"] or i in ("macro avg", "weighted avg")]]
     st.dataframe(rep.round(3), width='stretch')
-    st.caption("N = normal/BBB/escape, S = supraventricular ectopic, V = ventricular ectopic, F = fusion, Q = paced/unclassifiable (AAMI EC57 grouping).")
+    if "N" in ml["labels"]:
+        st.caption("N = normal/BBB/escape, S = supraventricular ectopic, V = ventricular ectopic, F = fusion, Q = paced/unclassifiable (AAMI EC57 grouping).")
+
+
+def show_ml_all(results):
+    st.markdown("### 🎯 Classification accuracy (computed from the uploaded labels)")
+    ml_all = results.get("ml_all") or {}
+    if not ml_all:
+        st.warning(results.get("ml_msg") or "Classifier could not be evaluated.")
+        return
+    for title, ml in ml_all.items():
+        if len(ml_all) > 1 or title != SIG_TITLE:
+            st.markdown(f"#### {title}")
+        show_ml_one(ml)
 
 
 def show_waveform_block(results, key_prefix):
     names = sorted(results["per"].keys())
     sel = st.selectbox("Record", names, key=f"{key_prefix}_rec")
-    kind, path = results["recs"][sel]
+    kind, path, ann = results["recs"][sel]
     try:
-        rec = load_any(kind, path, st.session_state["opts"])
+        rec = load_any(kind, path, ann, st.session_state["opts"])
     except Exception as e:
         st.error(f"Could not reload record: {e}")
         return sel, None
@@ -998,11 +1361,13 @@ def report_html(results, sel):
         f"<td>{html.escape(TIER_ICON[c['tier']])}</td><td>{html.escape(res['conditions'][c['id']]['evidence'])}</td></tr>"
         for c in CONDITIONS)
     acc = (f"Hold-out accuracy {ml['accuracy']:.2%}, macro F1 {ml['macro_f1']:.2%} "
-           f"({ml['n_test']:,} test beats)") if ml else "Not computed (no reference annotations)"
+           f"({ml['n_test']:,} test beats)") if ml else "Not computed (no reference labels)"
+    lg = logo_b64()
+    logo_tag = f"<img src='data:image/png;base64,{lg}' style='height:110px'><br>" if lg else ""
     return f"""<html><head><meta charset="utf-8"><title>HRIDAYA report</title>
-<style>body{{font-family:Arial;margin:30px;color:#1a1a1a}}table{{border-collapse:collapse;width:100%}}
-td,th{{border:1px solid #F8BBD0;padding:6px;font-size:13px}}th{{background:#FCE4EC}}h1{{color:#C2185B}}</style></head><body>
-<h1>HRIDAYA - ECG Screening Report</h1>
+<style>body{{font-family:Arial;margin:30px;color:#3A1F1F}}table{{border-collapse:collapse;width:100%}}
+td,th{{border:1px solid #D4AF37;padding:6px;font-size:13px}}th{{background:#F3E7C9}}h1{{color:#8B1E23}}</style></head><body>
+{logo_tag}<h1>HRIDAYA - ECG Screening Report</h1>
 <p><b>Dataset:</b> {html.escape(results['dataset'])} &nbsp; <b>Record:</b> {html.escape(sel)} &nbsp; <b>Generated:</b> {results['time']}</p>
 <p><b>Overall screening risk:</b> {res['risk']} &nbsp; <b>Median HR:</b> {res['hr_med']:.0f} bpm &nbsp;
 <b>QRS:</b> {res['qrs_ms']:.0f} ms &nbsp; <b>PR:</b> {res['pr_ms']:.0f} ms &nbsp; <b>QTc:</b> {res['qtc_ms']:.0f} ms</p>
@@ -1018,24 +1383,33 @@ td,th{{border:1px solid #F8BBD0;padding:6px;font-size:13px}}th{{background:#FCE4
 # 8. PAGES
 # ======================================================================
 def page_home():
+    if LOGO:
+        _, mid, _ = st.columns([1, 2, 1])
+        with mid:
+            st.image(LOGO, width=360)
     st.title("💓 HRIDAYA (हृदय): ECG Research Companion")
     st.markdown("##### Multi-class heartbeat classification & 13-condition clinical screener")
-    st.info("Accuracy and every other figure in this app are computed from the dataset you upload - nothing is pre-filled. "
-            "Go to **📁 MIT-BIH / ECG Zip Upload** to begin.")
+    st.info("Accuracy and every other figure in this app are computed from the data you upload - nothing is pre-filled. "
+            "Go to **📁 ECG Data Upload** to begin.")
     st.markdown("### The 13 conditions screened")
     st.dataframe(pd.DataFrame([{"#": c["id"], "Condition": c["name"], "Description": c["desc"],
                                 "Risk tier": TIER_ICON[c["tier"]], "Needs": c["needs"]} for c in CONDITIONS]),
                  width='stretch', hide_index=True)
-    st.markdown("### Supported uploads")
+    st.markdown("### Supported uploads (any ECG database)")
     st.markdown(
+        "Upload a **.zip** or select the **individual files together**. Nested folders are searched recursively.\n"
         "- **WFDB records** (`.hea` + `.dat`/`.mat`, optional `.atr`): MIT-BIH, INCART, European ST-T, PTB, PhysioNet challenge sets, etc.\n"
-        "- **CSV/TXT raw signals** (one column per lead; set sampling rate/units in the sidebar).\n"
-        "- Nested folders are searched recursively.\n"
-        "- Pre-segmented beat matrices (e.g. 187-column Kaggle files) are *not* supported - they contain no rhythm, PR or QT information.")
+        "- **CSV/TXT signal + annotation text:** a file like `100.csv` next to `100annotations.txt` (PhysioNet text format) is paired automatically. "
+        "The text file becomes the reference labels, so accuracy and validation work. If the CSV has a time column like `0:00.003`, the sampling rate is worked out automatically.\n"
+        "- **Pre-segmented beat CSVs** such as Kaggle `mitbih_train.csv` / `mitbih_test.csv` (one beat per row, last column 0-4 = N, S, V, F, Q): "
+        "you get classifier accuracy and a confusion matrix only - no rhythm, PR or QT screening, because these files contain no timing data. "
+        "If both a *train* and a *test* file are uploaded, the model is trained on train and scored on the unseen test file.\n"
+        "- **CSV/TXT with no annotations:** the 13-condition screening runs, but accuracy can't be computed and the app says so.\n"
+        "- **Unknown sampling rate:** set it in the sidebar (*Analysis options*).")
     st.markdown("### How results are produced")
     st.markdown(
-        "- **Accuracy:** a Random-Forest beat classifier is trained/tested on the dataset's own `.atr` annotations. "
-        "Without annotations, accuracy can't be computed and the app says so.\n"
+        "- **Accuracy:** a Random-Forest beat classifier is trained/tested on the labels that come with your upload. "
+        "Without labels, accuracy can't be computed and the app says so.\n"
         "- **13 conditions:** signal-processing rules (R-peak detection, RR irregularity, PR/QRS/ST/QT delineation). "
         "Conditions that the available leads can't support are marked *Not assessable* rather than guessed.\n"
         "- **Validation:** rule outputs are compared with the dataset's rhythm/beat annotations (AFib, 2nd-degree block, LBBB, RBBB).")
@@ -1043,49 +1417,65 @@ def page_home():
 
 
 def page_upload():
-    st.title("📁 Upload MIT-BIH / ECG ZIP Archive")
+    st.title("📁 ECG Data Upload")
     if not WFDB_OK:
-        st.error("The `wfdb` package is missing. Run `pip install wfdb` and restart.")
-    up = st.file_uploader("Upload ECG dataset (.zip)", type=["zip"])
+        st.warning("The `wfdb` package is missing, so WFDB (.hea/.dat) records can't be read. CSV/TXT uploads still work. Run `pip install wfdb` to enable WFDB.")
+    ups = st.file_uploader(
+        "Upload ECG data: a .zip, or the individual files together (e.g. 100.csv + 100annotations.txt, or .hea + .dat + .atr)",
+        type=["zip", "csv", "txt", "hea", "dat", "atr", "mat"], accept_multiple_files=True)
+    st.caption("Unknown sampling rate? Set it under **Analysis options** in the sidebar. "
+               "Beat-matrix files (one beat per row, last column = class 0-4) give accuracy + confusion matrix only.")
     opts = st.session_state["opts"]
 
-    if up is not None:
-        sig = f"{up.name}:{up.size}"
+    if ups:
+        sig = "|".join(f"{u.name}:{u.size}" for u in ups)
         if st.session_state.get("upload_sig") != sig:
             old = st.session_state.get("workdir")
             if old and os.path.isdir(old):
                 shutil.rmtree(old, ignore_errors=True)
             wd = tempfile.mkdtemp(prefix="hridaya_")
-            with st.spinner("Extracting archive..."):
-                safe_extract(up, wd)
-            st.session_state.update(workdir=wd, upload_sig=sig, upload_name=up.name, results=None,
-                                    found=discover_records(wd))
+            with st.spinner("Reading uploaded files..."):
+                ingest_uploads(ups, wd)
+            st.session_state.update(workdir=wd, upload_sig=sig,
+                                    upload_name=ups[0].name if len(ups) == 1 else f"{ups[0].name} (+{len(ups) - 1} files)",
+                                    results=None, found=discover_records(wd))
         found = st.session_state["found"]
         if not found:
-            st.error("No ECG records found (need `.hea`/`.dat` WFDB files or `.csv`/`.txt` signals) in the ZIP.")
+            st.error("No ECG data found. Need WFDB files (`.hea`/`.dat`) or `.csv`/`.txt` signals / beat files in the upload.")
         else:
             wf = sum(1 for v in found.values() if v[0] == "wfdb")
-            st.success(f"Found {len(found)} record(s): {wf} WFDB, {len(found) - wf} CSV/TXT.")
+            paired = sum(1 for v in found.values() if v[0] == "csv" and v[2])
+            st.success(f"Found {len(found)} record file(s): {wf} WFDB, {len(found) - wf} CSV/TXT "
+                       f"({paired} paired with an annotation text file).")
             if st.button("▶ Run full analysis", type="primary"):
                 st.session_state["results"] = run_pipeline(found, opts, st.session_state["upload_name"])
 
     results = st.session_state.get("results")
     if not results:
-        st.caption("No analysis yet - results (accuracy, confusion matrix, waveform, risk) appear here after you upload a dataset and run the analysis.")
+        st.caption("No analysis yet - results (accuracy, confusion matrix, waveform, risk) appear here after you upload data and run the analysis.")
         footer()
         return
     per = results["per"]
     st.markdown("---")
     st.header(f"Results - {results['dataset']}")
     if results["skipped"]:
-        with st.expander(f"⚠️ {len(results['skipped'])} record(s) skipped"):
+        with st.expander(f"⚠️ {len(results['skipped'])} file(s) skipped"):
             st.json(results["skipped"])
+
+    show_ml_all(results)
+
+    if results["beat_files"]:
+        st.markdown("### 🧬 Pre-segmented beat files read")
+        st.dataframe(pd.DataFrame(list(results["beat_files"].values())), width='stretch', hide_index=True)
+
     if not per:
-        st.error("No record could be analysed.")
+        if results["ml_all"]:
+            st.info("These files contain isolated beats only (no continuous signal or timing), so the 13-condition rhythm / PR / QT screening "
+                    "was not run. Upload raw signal records to get it.")
+        else:
+            st.error("No record could be analysed.")
         footer()
         return
-
-    show_ml(results["ml"], results["ml_msg"])
 
     st.markdown("### 🩺 Abnormalities detected - 13-condition evaluation (all records)")
     st.dataframe(condition_summary(per), width='stretch', hide_index=True)
@@ -1100,7 +1490,8 @@ def page_upload():
 
     st.markdown("### ⚠️ Risk stratification per record")
     df = pd.DataFrame([{
-        "Record": n, "Risk": r["risk"], "Beats": r["n_beats"], "HR (bpm)": round(r["hr_med"], 0) if np.isfinite(r["hr_med"]) else None,
+        "Record": n, "Risk": r["risk"], "Beats": r["n_beats"], "Fs (Hz)": round(r["fs"], 1), "Fs source": r["fs_source"],
+        "HR (bpm)": round(r["hr_med"], 0) if np.isfinite(r["hr_med"]) else None,
         "QRS (ms)": round(r["qrs_ms"], 0) if np.isfinite(r["qrs_ms"]) else None,
         "PR (ms)": round(r["pr_ms"], 0) if np.isfinite(r["pr_ms"]) else None,
         "QTc (ms)": round(r["qtc_ms"], 0) if np.isfinite(r["qtc_ms"]) else None,
@@ -1108,6 +1499,8 @@ def page_upload():
         "Flagged": ", ".join(COND_BY_ID[i]["name"].split(" (")[0] for i, c in r["conditions"].items() if c["status"] in FLAGGED) or "-",
     } for n, r in per.items()])
     st.dataframe(df, width='stretch', hide_index=True)
+    if any(r["fs_source"] == "sidebar setting" for r in per.values()):
+        st.caption("Records marked *sidebar setting* had no time column to read the sampling rate from - check the value under Analysis options.")
 
     st.markdown("### 📈 Waveform")
     sel, res = show_waveform_block(results, "up")
@@ -1130,7 +1523,7 @@ def page_screener():
     m2.metric("Duration", f"{res['duration_s'] / 60:.1f} min")
     m3.metric("Beats", f"{res['n_beats']:,}")
     m4.metric("Screening risk", res["risk"])
-    st.caption(f"Leads in file: {res['leads']} - analysis lead: {res['main_lead']}")
+    st.caption(f"Leads in file: {res['leads']} - analysis lead: {res['main_lead']} - sampling rate from: {res['fs_source']}")
     m5, m6, m7, m8 = st.columns(4)
     f = lambda v, u: "n/a" if not np.isfinite(v) else f"{v:.0f} {u}"
     m5.metric("Median HR", f(res["hr_med"], "bpm"))
@@ -1175,21 +1568,26 @@ def page_risk():
         st.markdown("**Median ST deviation (J+60 ms)**")
         st.table(pd.DataFrame({"Lead": list(r["st_mv"].keys()), "ST (mV)": [round(v, 3) for v in r["st_mv"].values()]}))
     if r["risk"] in ("High", "Moderate"):
-        st.info("Consider cardiology review - see **🏥 Cardiologists in Bangalore**.")
+        st.info("Consider cardiology review - see **🏥 Cardiologists (Bengaluru & Mumbai)**.")
     footer()
 
 
 def page_doctors():
-    st.title("🏥 Cardiologists in Bangalore")
+    st.title("🏥 Cardiologists (Bengaluru & Mumbai)")
     st.caption("Listing supplied by the author. Please verify availability, fees and credentials directly with the clinic before visiting.")
+    city = st.radio("City", ["All", "Bengaluru", "Mumbai"], horizontal=True)
     for d in DOCTORS:
+        if city != "All" and d["city"] != city:
+            continue
         q = quote_plus(f"{d['name'].split(' (')[0]} cardiologist {d['loc']}")
+        note = f"<br><i>{html.escape(d['note'])}</i>" if d.get("note") else ""
+        extra = "".join(f" &nbsp;|&nbsp; <a href='{html.escape(u)}' target='_blank'>{html.escape(t)}</a>" for t, u in d.get("links", []))
         st.markdown(
             f"<div class='doc-card'><h4 style='margin:0'>{html.escape(d['name'])}</h4>"
-            f"<b>Experience:</b> {d['exp']}<br><b>Specialization:</b> {html.escape(d['spec'])}<br>"
-            f"<b>Location:</b> {html.escape(d['loc'])}<br>"
+            f"<b>Experience:</b> {html.escape(d['exp'])}<br><b>Specialization:</b> {html.escape(d['spec'])}<br>"
+            f"<b>Location:</b> {html.escape(d['loc'])}{note}<br>"
             f"<a href='https://www.google.com/maps/search/?api=1&query={q}' target='_blank'>📍 Open in Google Maps</a> &nbsp;|&nbsp; "
-            f"<a href='https://www.google.com/search?q={q}' target='_blank'>🔎 Find contact details</a></div>",
+            f"<a href='https://www.google.com/search?q={q}' target='_blank'>🔎 Find contact details</a>{extra}</div>",
             unsafe_allow_html=True)
     st.warning("🚨 Chest pain, fainting, breathlessness or palpitations with dizziness are emergencies - call your local emergency number (112 in India) immediately.")
     footer()
@@ -1234,35 +1632,42 @@ def page_review():
 # 9. MAIN
 # ======================================================================
 def main():
-    st.set_page_config(page_title="HRIDAYA - ECG Research Companion", page_icon="💓", layout="wide")
+    icon = "💓"
+    if LOGO:
+        try:
+            from PIL import Image
+            icon = Image.open(LOGO)
+        except Exception:
+            icon = "💓"
+    st.set_page_config(page_title="HRIDAYA - ECG Research Companion", page_icon=icon, layout="wide")
     st.markdown(CSS, unsafe_allow_html=True)
     st.markdown("<div class='disclaimer'>⚠️ <b>Research prototype.</b> Not a medical device; it does not diagnose, treat, cure or prevent any condition. "
                 "Results can be wrong - never use them for emergencies or treatment decisions. Do not upload identifiable patient data.</div>",
                 unsafe_allow_html=True)
+    if LOGO:
+        st.sidebar.image(LOGO, width=230)
     st.sidebar.title("💓 HRIDAYA Controls")
-    page = st.sidebar.radio("Navigate Workspace:", [
-        "🏠 Home & Overview",
-        "📁 MIT-BIH / ECG Zip Upload",
-        "🔍 Live Waveform & 13-Condition Screener",
-        "⚠️ Clinical Risk Summary",
-        "🏥 Cardiologists in Bangalore",
-        "📝 Review & Sign-Off Report",
-    ])
+    pages = {
+        "🏠 Home & Overview": page_home,
+        "📁 ECG Data Upload": page_upload,
+        "🔍 Live Waveform & 13-Condition Screener": page_screener,
+        "⚠️ Clinical Risk Summary": page_risk,
+        "🏥 Cardiologists (Bengaluru & Mumbai)": page_doctors,
+        "📝 Review & Sign-Off Report": page_review,
+    }
+    page = st.sidebar.radio("Navigate Workspace:", list(pages.keys()))
     with st.sidebar.expander("Analysis options"):
-        csv_fs = st.number_input("CSV/TXT sampling rate (Hz)", 50, 2000, 360)
-        csv_units = st.selectbox("CSV amplitude units", ["mV", "µV", "arbitrary"])
+        csv_fs = st.number_input("Sampling rate for CSV/TXT when it can't be detected (Hz)", 50, 2000, 360)
+        force_fs = st.checkbox("Always use this sampling rate (ignore auto-detect)", False)
+        csv_units = st.selectbox("CSV amplitude units (if the file doesn't state them)", ["mV", "µV", "arbitrary"])
         max_beats = st.slider("Max beats for classifier", 20_000, 150_000, 80_000, step=10_000)
         patient_wise = st.checkbox("Also run patient-wise validation", True)
-    st.session_state["opts"] = dict(csv_fs=csv_fs, csv_units=csv_units, max_beats=max_beats, patient_wise=patient_wise)
+    st.session_state["opts"] = dict(csv_fs=csv_fs, csv_units=csv_units, max_beats=max_beats,
+                                    patient_wise=patient_wise, force_fs=force_fs)
     st.sidebar.markdown("---")
     st.sidebar.markdown(f"**© Copyright Reserved**  \n**Author:** {OWNER['name']}  \n**Phone:** {OWNER['phone']}  \n**Email:** {OWNER['email']}")
 
-    {"🏠 Home & Overview": page_home,
-     "📁 MIT-BIH / ECG Zip Upload": page_upload,
-     "🔍 Live Waveform & 13-Condition Screener": page_screener,
-     "⚠️ Clinical Risk Summary": page_risk,
-     "🏥 Cardiologists in Bangalore": page_doctors,
-     "📝 Review & Sign-Off Report": page_review}[page]()
+    pages[page]()
 
 
 if __name__ == "__main__":
