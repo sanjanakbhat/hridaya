@@ -1628,7 +1628,7 @@ def page_reviewer():
             st.markdown(f"<img class='reviewer-photo' src='data:image/{ext};base64,{ph}' alt='{html.escape(REVIEWER['name'])}'>",
                         unsafe_allow_html=True)
         else:
-            st.info("Photo not found. Place it at **assets/dhairya.png** next to app.py.")
+            st.info("Photo not found. Place it at **assets/Smiling Nighttime Portrait with Bokeh.png** next to app.py.")
     with c2:
         st.markdown(
             f"<div class='doc-card'><h3 style='margin:0;color:#8B1E23'>{html.escape(REVIEWER['name'])}</h3>"
