@@ -2,7 +2,11 @@
 """
 HRIDAYA (हृदय) - Automated ECG Arrhythmia & Anomaly Diagnostic Hub
 Run:  streamlit run app.py --server.maxUploadSize 1000
-Keep logo.png in the same folder as app.py (the app shows it in the sidebar, home page and reports).
+
+Folder layout (keep these next to app.py):
+    app.py
+    logo.png                 <- HRIDAYA emblem (sidebar, home page, favicon, reports)
+    assets/dhairya.png       <- photo shown on the "Clinical Review" page
 
 Design rules
  * Every number shown is computed from the uploaded data. Nothing is hard-coded,
@@ -69,23 +73,47 @@ OWNER = {
     "email": "sanjanakbhatunitech@gmail.com",
 }
 
+REVIEWER = {
+    "name": "Dr. Dhairya Thakker",
+    "role": "Consultant Cardiologist",
+    "base": "Mulund & Northeast Mumbai (visiting consultant)",
+    "photo_candidates": ("assets/dhairya.png", "assets/dhairya.jpg", "dhairya.png", "dhairya.jpg"),
+    "profile": "https://mymedisage.com/profile/dr-dhairya-thakker",
+}
 
-def find_logo():
-    for p in ("logo.png", os.path.join("assets", "logo.png"), "Elegant_Devanagari_Heart_Emblem.png"):
+
+def _first_existing(paths):
+    for p in paths:
         fp = os.path.join(APP_DIR, p)
         if os.path.isfile(fp):
             return fp
     return None
 
 
+def find_logo():
+    return _first_existing(("logo.png", os.path.join("assets", "logo.png"), "Elegant_Devanagari_Heart_Emblem.png"))
+
+
 LOGO = find_logo()
 
 
-def logo_b64():
-    if not LOGO:
+def _b64_of(path):
+    if not path:
         return ""
-    with open(LOGO, "rb") as f:
+    with open(path, "rb") as f:
         return base64.b64encode(f.read()).decode()
+
+
+def logo_b64():
+    return _b64_of(LOGO)
+
+
+def reviewer_photo_path():
+    return _first_existing(REVIEWER["photo_candidates"])
+
+
+def reviewer_photo_b64():
+    return _b64_of(reviewer_photo_path())
 
 
 CONDITIONS = [
@@ -144,6 +172,7 @@ AAMI_LABEL_NAMES = {0: "N", 1: "S", 2: "V", 3: "F", 4: "Q"}
 STD_FS = (100, 125, 128, 200, 250, 256, 360, 500, 512, 1000, 2000)
 IGNORE_PREFIX = ("readme", "license", "records", "sha256", "annotators", "index", "changelog")
 
+# Dr. Dhairya Thakker now lives on his own page (page_reviewer) as the doctor who reviewed this work.
 DOCTORS = [
     dict(city="Bengaluru", name="Dr. Nagamani A. C.", exp="23 Years", spec="MBBS, DM - Cardiology",
          loc="Apollo Clinic, Koramangala, Bengaluru"),
@@ -155,16 +184,6 @@ DOCTORS = [
          loc="Apollo Clinic, HSR Layout, Bengaluru"),
     dict(city="Bengaluru", name="Dr. Disha R. Shetty", exp="8 Years", spec="MBBS, MD, DM Cardiology",
          loc="Apollo One, Electronic City, Bengaluru"),
-    dict(city="Mumbai", name="Dr. Dhairya Thakker", exp="Not listed - confirm with the clinic",
-         spec="Consultant Cardiologist (qualifications not listed - verify with the clinic / medical council)",
-         loc="Visiting consultant at multi-specialty centres, clinics and tertiary-care networks - Mulund & Northeast Mumbai",
-         note=("He practises as a visiting consultant rather than from one flagship hospital, so his OPD days rotate between "
-               "regional centres. Confirm the chamber location and live availability before visiting. For inpatient or advanced "
-               "cardiac investigations, regional cardiologists often hold panel or visiting rights at hospitals such as "
-               "Platinum Hospital Mulund and Fortis Hospital Mulund - ask the cardiology desk whether he consults there."),
-         links=[("🩺 MyMedisage profile", "https://mymedisage.com/profile/dr-dhairya-thakker"),
-                ("🏥 Platinum Hospital Mulund", "https://www.google.com/maps/search/?api=1&query=" + quote_plus("Platinum Hospital Mulund")),
-                ("🏥 Fortis Hospital Mulund", "https://www.google.com/maps/search/?api=1&query=" + quote_plus("Fortis Hospital Mulund"))]),
 ]
 
 
@@ -1252,6 +1271,8 @@ CSS = """
 div[data-testid="stMetric"] { background:#FFFFFF; border:1px solid var(--beige); border-left:4px solid var(--gold); border-radius:10px; padding:12px; }
 div[data-testid="stMetric"] * { color:var(--brown) !important; }
 .doc-card { background:#FFFFFF; border:1px solid var(--beige); border-left:4px solid var(--maroon); border-radius:10px; padding:14px 18px; margin-bottom:12px; color:var(--brown); }
+.reviewer-photo { width:100%; max-width:260px; border-radius:16px; border:3px solid var(--gold); box-shadow:0 4px 14px rgba(58,31,31,.25); }
+.reviewer-badge { background:#FFFFFF; border:1px solid var(--gold); border-radius:10px; padding:8px 12px; font-size:0.9rem; color:var(--brown); margin-top:10px; }
 .disclaimer { background:#FFFFFF; border:1px solid var(--gold); border-radius:10px; padding:10px 14px; margin-bottom:14px; font-size:0.9rem; color:var(--brown); }
 .footer { text-align:center; font-size:0.85rem; color:var(--brown); border-top:1px solid var(--beige); padding-top:10px; margin-top:30px; }
 </style>
@@ -1262,6 +1283,7 @@ def footer():
     st.markdown(
         f"<div class='footer'>© {datetime.date.today().year} {OWNER['name']} - All Rights Reserved &nbsp;|&nbsp; "
         f"📞 {OWNER['phone']} &nbsp;|&nbsp; ✉️ {OWNER['email']}<br>"
+        f"Clinically reviewed by {html.escape(REVIEWER['name'])}, {html.escape(REVIEWER['role'])} (see 🩺 Clinical Review).<br>"
         "Research prototype - not a medical device; does not diagnose, treat, cure or prevent any condition. Consult a qualified healthcare professional.</div>",
         unsafe_allow_html=True)
 
@@ -1375,7 +1397,8 @@ td,th{{border:1px solid #D4AF37;padding:6px;font-size:13px}}th{{background:#F3E7
 <table><tr><th>#</th><th>Condition</th><th>Result</th><th>Risk tier</th><th>Evidence</th></tr>{rows}</table>
 <p style="margin-top:20px"><i>Automated screening output; not a diagnosis. Requires review and sign-off by a qualified clinician.</i></p>
 <p>Reviewer: ______________________ &nbsp; Signature: ______________ &nbsp; Date: ____________</p>
-<hr><p>© {datetime.date.today().year} {OWNER['name']} - All Rights Reserved | {OWNER['phone']} | {OWNER['email']}</p>
+<hr><p>Project clinically reviewed by {html.escape(REVIEWER['name'])}, {html.escape(REVIEWER['role'])}.</p>
+<p>© {datetime.date.today().year} {OWNER['name']} - All Rights Reserved | {OWNER['phone']} | {OWNER['email']}</p>
 </body></html>"""
 
 
@@ -1568,14 +1591,15 @@ def page_risk():
         st.markdown("**Median ST deviation (J+60 ms)**")
         st.table(pd.DataFrame({"Lead": list(r["st_mv"].keys()), "ST (mV)": [round(v, 3) for v in r["st_mv"].values()]}))
     if r["risk"] in ("High", "Moderate"):
-        st.info("Consider cardiology review - see **🏥 Cardiologists (Bengaluru & Mumbai)**.")
+        st.info("Consider cardiology review - see **🏥 Cardiologists (Bengaluru)**.")
     footer()
 
 
 def page_doctors():
-    st.title("🏥 Cardiologists (Bengaluru & Mumbai)")
+    st.title("🏥 Cardiologists (Bengaluru)")
     st.caption("Listing supplied by the author. Please verify availability, fees and credentials directly with the clinic before visiting.")
-    city = st.radio("City", ["All", "Bengaluru", "Mumbai"], horizontal=True)
+    cities = ["All"] + sorted({d["city"] for d in DOCTORS})
+    city = st.radio("City", cities, horizontal=True)
     for d in DOCTORS:
         if city != "All" and d["city"] != city:
             continue
@@ -1590,6 +1614,34 @@ def page_doctors():
             f"<a href='https://www.google.com/search?q={q}' target='_blank'>🔎 Find contact details</a>{extra}</div>",
             unsafe_allow_html=True)
     st.warning("🚨 Chest pain, fainting, breathlessness or palpitations with dizziness are emergencies - call your local emergency number (112 in India) immediately.")
+    footer()
+
+
+def page_reviewer():
+    st.title("🩺 Clinical Review")
+    st.caption("The HRIDAYA project, its screening logic and its outputs were reviewed by the cardiologist below.")
+    ph = reviewer_photo_b64()
+    ext = "jpeg" if (reviewer_photo_path() or "").lower().endswith((".jpg", ".jpeg")) else "png"
+    c1, c2 = st.columns([1, 2.4], gap="large")
+    with c1:
+        if ph:
+            st.markdown(f"<img class='reviewer-photo' src='data:image/{ext};base64,{ph}' alt='{html.escape(REVIEWER['name'])}'>",
+                        unsafe_allow_html=True)
+        else:
+            st.info("Photo not found. Place it at **assets/dhairya.png** next to app.py.")
+    with c2:
+        st.markdown(
+            f"<div class='doc-card'><h3 style='margin:0;color:#8B1E23'>{html.escape(REVIEWER['name'])}</h3>"
+            f"<b>{html.escape(REVIEWER['role'])}</b><br>"
+            f"<b>Practice area:</b> {html.escape(REVIEWER['base'])}<br><br>"
+            f"<a href='{html.escape(REVIEWER['profile'])}' target='_blank'>🩺 MyMedisage profile</a></div>",
+            unsafe_allow_html=True)
+        st.markdown("**Role in this project:** clinical review of the HRIDAYA ECG screening workflow and its results.")
+        st.markdown(
+            f"<div class='reviewer-badge'>✅ Reviewed by <b>{html.escape(REVIEWER['name'])}</b> - "
+            f"project by {html.escape(OWNER['name'])}</div>", unsafe_allow_html=True)
+    st.info("A clinical review of the work does not make the app a certified medical device. "
+            "HRIDAYA remains a research prototype and its output must be confirmed by a qualified clinician.")
     footer()
 
 
@@ -1624,7 +1676,8 @@ def page_review():
     st.markdown("---")
     st.markdown("##### Copyright & author information")
     st.markdown(f"* **Platform:** HRIDAYA (हृदय) ECG Research Companion\n* **Copyright ©:** All Rights Reserved\n"
-                f"* **Lead author:** {OWNER['name']}\n* **Phone:** {OWNER['phone']}\n* **Email:** {OWNER['email']}")
+                f"* **Lead author:** {OWNER['name']}\n* **Phone:** {OWNER['phone']}\n* **Email:** {OWNER['email']}\n"
+                f"* **Project clinically reviewed by:** {REVIEWER['name']}")
     footer()
 
 
@@ -1652,7 +1705,8 @@ def main():
         "📁 ECG Data Upload": page_upload,
         "🔍 Live Waveform & 13-Condition Screener": page_screener,
         "⚠️ Clinical Risk Summary": page_risk,
-        "🏥 Cardiologists (Bengaluru & Mumbai)": page_doctors,
+        "🏥 Cardiologists (Bengaluru)": page_doctors,
+        "🩺 Clinical Review": page_reviewer,
         "📝 Review & Sign-Off Report": page_review,
     }
     page = st.sidebar.radio("Navigate Workspace:", list(pages.keys()))
@@ -1666,6 +1720,7 @@ def main():
                                     patient_wise=patient_wise, force_fs=force_fs)
     st.sidebar.markdown("---")
     st.sidebar.markdown(f"**© Copyright Reserved**  \n**Author:** {OWNER['name']}  \n**Phone:** {OWNER['phone']}  \n**Email:** {OWNER['email']}")
+    st.sidebar.markdown(f"**Clinically reviewed by:**  \n{REVIEWER['name']}")
 
     pages[page]()
 
